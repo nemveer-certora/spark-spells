@@ -1,0 +1,24 @@
+[profile.default]
+src = 'src'
+out = 'out'
+libs = ['lib']
+fs_permissions = [
+    { access = "read", path = "./out" },
+    { access = "write", path = "./reports" }
+]
+solc = "0.8.25"
+optimizer = true
+ffi = true
+evm_version = "cancun"
+
+# Very large gas limit for big tests
+gas_limit = "18446744073709551615"
+
+remappings = [
+    "morpho-blue/=lib/metamorpho/lib/morpho-blue/",
+    "sparklend-advanced/=lib/sparklend-advanced/",
+    "sparklend-v1-core/=lib/sparklend-v1-core/contracts/",
+    "lib/openzeppelin-contracts/=lib/openzeppelin-contracts/"  # Needed for MorphoUpgradableOracle in sparklend-advanced/lib/openzeppelin-contracts
+]
+
+# See more config options https://github.com/foundry-rs/foundry/tree/master/config
