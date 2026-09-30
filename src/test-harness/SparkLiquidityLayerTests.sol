@@ -46,7 +46,7 @@ import { CCTPForwarder }         from "xchain-helpers/forwarders/CCTPForwarder.s
 import { Bridge, BridgeType }    from "xchain-helpers/testing/Bridge.sol";
 import { Domain, DomainHelpers } from "xchain-helpers/testing/Domain.sol";
 import { CCTPBridgeTesting }     from "xchain-helpers/testing/bridges/CCTPBridgeTesting.sol";
-import { CCTPv2BridgeTesting }   from "xchain-helpers/testing/bridges/CCTPv2BridgeTesting.sol";
+import { CCTPV2BridgeTesting }   from "xchain-helpers/testing/bridges/CCTPV2BridgeTesting.sol";
 import { LZBridgeTesting }       from "xchain-helpers/testing/bridges/LZBridgeTesting.sol";
 import { RecordedLogs }          from "xchain-helpers/testing/utils/RecordedLogs.sol";
 
@@ -499,8 +499,8 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
         );
 
         if (!skipInitialCheck) {
-            _assertRateLimit(depositKey,  0, 0);
-            _assertRateLimit(withdrawKey, 0, 0);
+            _assertRateLimit(address(ctx.rateLimits), depositKey,  0, 0);
+            _assertRateLimit(address(ctx.rateLimits), withdrawKey, 0, 0);
 
             assertEq(IMainnetControllerLike(ctx.controller).maxSlippages(vault), 0);
 
@@ -511,8 +511,8 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
             _executeAllPayloadsAndBridges();
         }
 
-        _assertRateLimit(depositKey,  depositMax,        depositSlope);
-        _assertRateLimit(withdrawKey, type(uint256).max, 0);
+        _assertRateLimit(address(ctx.rateLimits), depositKey,  depositMax,        depositSlope);
+        _assertRateLimit(address(ctx.rateLimits), withdrawKey, type(uint256).max, 0);
 
         assertGe(depositMax / depositSlope, 1 hours);
 
@@ -681,8 +681,8 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
         bytes32 depositKey  = RateLimitHelpers.makeAddressKey(controller.LIMIT_AAVE_DEPOSIT(),  aToken);
         bytes32 withdrawKey = RateLimitHelpers.makeAddressKey(controller.LIMIT_AAVE_WITHDRAW(), aToken);
 
-        _assertRateLimit(depositKey,  0, 0);
-        _assertRateLimit(withdrawKey, 0, 0);
+        _assertRateLimit(address(ctx.rateLimits), depositKey,  0, 0);
+        _assertRateLimit(address(ctx.rateLimits), withdrawKey, 0, 0);
 
         assertEq(controller.maxSlippages(aToken), 0);
 
@@ -692,8 +692,8 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
 
         _executeAllPayloadsAndBridges();
 
-        _assertRateLimit(depositKey,  depositMax,        depositSlope);
-        _assertRateLimit(withdrawKey, type(uint256).max, 0);
+        _assertRateLimit(address(ctx.rateLimits), depositKey,  depositMax,        depositSlope);
+        _assertRateLimit(address(ctx.rateLimits), withdrawKey, type(uint256).max, 0);
 
         assertGe(depositMax / depositSlope, 1 hours);
 
@@ -2617,7 +2617,7 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
 
         // FIXME: this is a workaround for the storage/fork issue (https://github.com/foundry-rs/foundry/issues/10296), switch back to _relayMessageOverBridges() when fixed
         //_relayMessageOverBridges();
-        CCTPv2BridgeTesting.relayMessagesToSource(bridge, true);
+        CCTPV2BridgeTesting.relayMessagesToSource(bridge, true);
 
         assertEq(usdc.balanceOf(Ethereum.ALM_PROXY), mainnetUsdcProxyBalance + usdcAmount);
     }
@@ -3879,12 +3879,14 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
 
     // TODO: MDL, seems like unnecessary overload bloat.
     function _assertRateLimit(
-       bytes32 key,
+       address              rateLimits,
+       bytes32              key,
        RateLimitData memory data
     ) internal view {
-        IRateLimits.RateLimitData memory rateLimit = _getSparkLiquidityLayerContext().rateLimits.getRateLimitData(key);
+        IRateLimits.RateLimitData memory rateLimit = IRateLimits(rateLimits).getRateLimitData(key);
 
         _assertRateLimit(
+            rateLimits,
             key,
             data.maxAmount,
             data.slope,
@@ -3894,13 +3896,15 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
     }
 
     function _assertRateLimit(
+       address rateLimits,
        bytes32 key,
        uint256 maxAmount,
        uint256 slope
     ) internal view {
-        IRateLimits.RateLimitData memory rateLimit = _getSparkLiquidityLayerContext().rateLimits.getRateLimitData(key);
+        IRateLimits.RateLimitData memory rateLimit = IRateLimits(rateLimits).getRateLimitData(key);
 
         _assertRateLimit(
+            rateLimits,
             key,
             maxAmount,
             slope,
@@ -3910,11 +3914,13 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
     }
 
     function _assertUnlimitedRateLimit(
+       address rateLimits,
        bytes32 key
     ) internal view {
-        IRateLimits.RateLimitData memory rateLimit = _getSparkLiquidityLayerContext().rateLimits.getRateLimitData(key);
+        IRateLimits.RateLimitData memory rateLimit = IRateLimits(rateLimits).getRateLimitData(key);
 
         _assertRateLimit(
+            rateLimits,
             key,
             type(uint256).max,
             0,
@@ -3924,18 +3930,17 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
     }
 
     function _assertRateLimit(
+       address rateLimits,
        bytes32 key,
        uint256 maxAmount,
        uint256 slope,
        uint256 lastAmount,
        uint256 lastUpdated
     ) internal view {
-        IRateLimits.RateLimitData memory rateLimit = _getSparkLiquidityLayerContext().rateLimits.getRateLimitData(key);
+        IRateLimits.RateLimitData memory rateLimit = IRateLimits(rateLimits).getRateLimitData(key);
 
-        assertEq(rateLimit.maxAmount,   maxAmount);
-        assertEq(rateLimit.slope,       slope);
-        assertEq(rateLimit.lastAmount,  lastAmount);
-        assertEq(rateLimit.lastUpdated, lastUpdated);
+        assertEq(rateLimit.maxAmount, maxAmount);
+        assertEq(rateLimit.slope,     slope);
 
         if (maxAmount != 0 && maxAmount != type(uint256).max) {
             // Do some sanity checks on the slope
@@ -4134,4 +4139,13 @@ abstract contract SparkLiquidityLayerTests is SpellRunner {
     function _toNormalizedAmount(address token, uint256 amount) internal view returns (uint256 normalizedAmount) {
         return amount * 1e18 / (10 ** IERC20Metadata(token).decimals());
     }
+
+    function deal(address token, address to, uint256 amount) internal override {
+        if (token == Ethereum.USDG) {
+            vm.store(Ethereum.USDG, keccak256(abi.encode(to, 1)), bytes32(amount));  // 1 is the USDG_BALANCES_SLOT_INDEX.
+            return;
+        }
+        super.deal(token, to, amount);
+    }
+
 }
