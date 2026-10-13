@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.25;
 
-import { IERC4626 } from 'forge-std/interfaces/IERC4626.sol';
+import { Vm, VmSafe } from "forge-std/Vm.sol";
 
-import { IERC20 } from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IERC20 }         from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import { IAccessControl } from "openzeppelin-contracts/contracts/access/IAccessControl.sol";
 
 import { Arbitrum } from "spark-address-registry/Arbitrum.sol";
 import { Ethereum } from "spark-address-registry/Ethereum.sol";
@@ -11,7 +12,7 @@ import { XLayer }   from "spark-address-registry/XLayer.sol";
 
 import { ChainIdUtils } from "src/libraries/ChainIdUtils.sol";
 
-import { Bridge, BridgeType }    from "lib/xchain-helpers/src/testing/Bridge.sol";
+import { Bridge }                from "lib/xchain-helpers/src/testing/Bridge.sol";
 import { CCTPV2BridgeTesting }   from "lib/xchain-helpers/src/testing/bridges/CCTPV2BridgeTesting.sol";
 import { CCTPForwarder }         from "lib/xchain-helpers/src/forwarders/CCTPForwarder.sol";
 import { DomainHelpers }         from "lib/xchain-helpers/src/testing/Domain.sol";
@@ -23,12 +24,6 @@ import { SparkLiquidityLayerTests } from "src/test-harness/SparkLiquidityLayerTe
 import { SpellTests }               from "src/test-harness/SpellTests.sol";
 
 interface IAccessControlsLike {
-
-    function DEFAULT_ADMIN_ROLE() external returns (bytes32);
-
-    function grantRole(bytes32 role, address account) external;
-
-    function revokeRole(bytes32 role, address account) external;
 
     function hasRole(bytes32 role, address account) external view returns (bool);
 
@@ -65,21 +60,286 @@ interface IALMProxyLike {
 
 }
 
+interface IArbitrumL1TokenGatewayLike {
+
+    event WithdrawalFinalized(address l1Token, address indexed _from, address indexed _to, uint256 indexed _exitNum, uint256 _amount);
+
+    function finalizeInboundTransfer(address l1Token, address from, address to, uint256 amount, bytes memory data) external payable;
+
+}
+
+interface IArbitrumOutboxLike {
+
+    event OutBoxTransactionExecuted(address indexed to, address indexed l2Sender, uint256 indexed zero, uint256 transactionIndex);
+
+    event SendRootUpdated(bytes32 indexed outputRoot, bytes32 indexed l2BlockHash);
+
+    error AlreadySpent(uint256 index);
+
+    function calculateItemHash(
+        address l2Sender,
+        address to,
+        uint256 l2Block,
+        uint256 l1Block,
+        uint256 l2Timestamp,
+        uint256 value,
+        bytes memory data
+    ) external pure returns (bytes32);
+
+    function executeTransaction(
+        bytes32[] memory proof,
+        uint256 index,
+        address l2Sender,
+        address to,
+        uint256 l2Block,
+        uint256 l1Block,
+        uint256 l2Timestamp,
+        uint256 value,
+        bytes memory data
+    ) external;
+
+    function isSpent(uint256 index) external view returns (bool);
+
+    function rollup() external view returns (address);
+
+    function roots(bytes32 root) external view returns (bytes32);
+
+    function updateSendRoot(bytes32 root, bytes32 l2BlockHash) external;
+
+}
+
+interface IArbitrumRollupLike {
+
+    struct GlobalState {
+        bytes32[2] bytes32Vals;  // [blockHash, sendRoot]
+        uint64[2]  u64Vals;      // [inboxPosition, positionInMessage]
+    }
+
+    struct AssertionState {
+        GlobalState globalState;
+        uint8       machineStatus;
+        bytes32     endHistoryRoot;
+    }
+
+    struct ConfigData {
+        bytes32 wasmModuleRoot;
+        uint256 requiredStake;
+        address challengeManager;
+        uint64  confirmPeriodBlocks;
+        uint64  nextInboxPosition;
+    }
+
+    struct BeforeStateData {
+        bytes32    prevPrevAssertionHash;
+        bytes32    sequencerBatchAcc;
+        ConfigData configData;  // the parent's config, validated against the parent's configHash on confirm
+    }
+
+    struct AssertionInputs {
+        BeforeStateData beforeStateData;
+        AssertionState  beforeState;
+        AssertionState  afterState;
+    }
+
+    struct AssertionNode {
+        uint64  firstChildBlock;
+        uint64  secondChildBlock;  // non-zero means a rival assertion exists (challenge)
+        uint64  createdAtBlock;
+        bool    isFirstChild;
+        uint8   status;            // 0 NoAssertion, 1 Pending, 2 Confirmed
+        bytes32 configHash;
+    }
+
+    event AssertionConfirmed(bytes32 indexed assertionHash, bytes32 blockHash, bytes32 sendRoot);
+
+    event AssertionCreated(
+        bytes32 indexed assertionHash,
+        bytes32 indexed parentAssertionHash,
+        AssertionInputs assertion,
+        bytes32 afterInboxBatchAcc,
+        uint256 inboxMaxCount,
+        bytes32 wasmModuleRoot,
+        uint256 requiredStake,
+        address challengeManager,
+        uint64  confirmPeriodBlocks
+    );
+
+    function confirmAssertion(
+        bytes32 assertionHash,
+        bytes32 prevAssertionHash,
+        AssertionState calldata confirmState,
+        bytes32 winningEdgeId,
+        ConfigData calldata prevConfig,
+        bytes32 inboxAcc
+    ) external;
+
+    function confirmPeriodBlocks() external view returns (uint64);
+
+    function getAssertion(bytes32 assertionHash) external view returns (AssertionNode memory);
+
+    function latestConfirmed() external view returns (bytes32);
+
+    function validatorWhitelistDisabled() external view returns (bool);
+
+}
+
 interface IBeaconLike {
-
-    function DEFAULT_ADMIN_ROLE() external returns (bytes32);
-
-    function grantRole(bytes32 role, address account) external;
-
-    function revokeRole(bytes32 role, address account) external;
 
     function hasRole(bytes32 role, address account) external view returns (bool);
 
     function getRoleMemberCount(bytes32 role) external view returns (uint256);
 
+    function getDispatch(bytes4 callSelector) external view returns (IControllerLike.Dispatch memory);
+
+}
+
+interface IBeamStateLike {
+
+    event AddCBeam(address indexed cBeam);
+
+    event AddController(address indexed controller);
+
+    event AddInitControllerActions(bytes32 indexed key, address indexed controller);
+
+    event AddInitRateLimits(bytes32 indexed key, address indexed rateLimits, uint256 maxAmount, uint256 slope);
+
+    event AddRateLimits(address indexed rateLimits);
+
+    event DelCBeam(address indexed cBeam);
+
+    event DelController(address indexed controller);
+
+    event DelInitControllerActions(bytes32 indexed key, address indexed controller);
+
+    event DelInitRateLimits(bytes32 indexed key, address indexed rateLimits);
+
+    event DelRateLimits(address indexed rateLimits);
+
+    event Deny(address indexed usr);
+
+    event Rely(address indexed usr);
+
+    event SetCBeamForController(address indexed controller, address indexed cBeam);
+
+    event SetCBeamForRateLimits(address indexed rateLimits, address indexed cBeam);
+
+    event SetHop(address indexed rateLimits, uint256 value);
+
+    event SetMaxChange(address indexed rateLimits, uint256 value);
+
+    event SetRoleAction(uint8 indexed role, bytes4 indexed sig, bool enabled);
+
+    event SetUserRole(address indexed who, uint8 indexed role, bool enabled);
+
+    event Start();
+
+    event Stop();
+
+    event UnsetCBeamForController(address indexed controller, address indexed cBeam);
+
+    event UnsetCBeamForRateLimits(address indexed rateLimits, address indexed cBeam);
+
+    function actionsRoles(bytes4 sig) external view returns (bytes32);
+
+    function addCBeam(address cBeam) external;
+
+    function addController(address controller) external;
+
+    function addInitControllerActions(bytes calldata data, address controller) external returns (bytes32 key);
+
+    function addInitRateLimits(bytes32 key, address rateLimits, uint256 maxAmount, uint256 slope) external;
+
+    function addRateLimits(address rateLimits) external;
+
+    function cBeams(address cBeam) external view returns (uint256);
+
+    function controllers(address controller) external view returns (uint256);
+
+    function controllersCBeams(address controller, address cBeam) external view returns (uint256);
+
+    function delCBeam(address cBeam) external;
+
+    function delController(address controller) external;
+
+    function delInitControllerActions(bytes32 key, address controller) external;
+
+    function delInitRateLimits(bytes32 key, address rateLimits) external;
+
+    function delRateLimits(address rateLimits) external;
+
+    function getHop(address rateLimits) external view returns (uint256);
+
+    function getMaxChange(address rateLimits) external view returns (uint256);
+
+    function hasUserRole(address usr, uint8 role) external view returns (bool);
+
+    function hop(address rateLimits) external view returns (uint256);
+
+    function isControllerActionEnabled(bytes32 key, address controller) external view returns (bool);
+
+    function maxChange(address rateLimits) external view returns (uint256);
+
+    function rateLimits(address rateLimits) external view returns (uint256);
+
+    function rateLimitsCBeams(address rateLimits, address cBeam) external view returns (uint256);
+
+    function setCBeamForController(address controller, address cBeam) external;
+
+    function setCBeamForRateLimits(address rateLimits, address cBeam) external;
+
+    function setHop(address rateLimits, uint256 value) external;
+
+    function setMaxChange(address rateLimits, uint256 value) external;
+
+    function start() external;
+
+    function stop() external;
+
+    function stopped() external view returns (bool);
+
+    function unsetCBeamForController(address controller, address cBeam) external;
+
+    function unsetCBeamForRateLimits(address rateLimits, address cBeam) external;
+
+    function wards(address usr) external view returns (uint256);
+
+}
+
+interface IConfiguratorLike {
+
+    event SetRateLimit(address indexed rateLimits, bytes32 indexed key, uint256 maxAmount, uint256 slope);
+
+    function beamState() external view returns (address);
+
+    function callControllerAction(address controller, bytes calldata data) external returns (bytes memory);
+
+    function setRateLimit(address rateLimits, bytes32 key, uint256 maxAmount, uint256 slope) external;
+
+    function zzz(address rateLimits, bytes32 key) external view returns (uint256);
+
 }
 
 interface IControllerLike {
+
+    struct Wire {
+        bytes4 callSelector;
+        bytes4 delegateSelector;
+    }
+
+    struct Config {
+        address facet;
+        Wire[]  wires;
+    }
+
+    struct Dispatch {
+        address facet;
+        bytes4  delegateSelector;
+    }
+
+    struct Integration {
+        bytes32 id;
+        Config  config;
+    }
 
     function cctp_getDomainParameters(uint32 destinationDomain)
         external
@@ -92,6 +352,26 @@ interface IControllerLike {
         external
         pure
         returns (bytes32 key);
+
+    function getConfig(bytes32 integrationId) external view returns (Config memory);
+
+    function getDispatch(bytes4 callSelector) external view returns (Dispatch memory);
+
+    function integrations() external view returns (Integration[] memory);
+
+    function removeIntegrations(bytes32[] calldata ids) external;
+
+    function updateIntegrations(bytes32[] calldata ids) external;
+
+}
+
+interface IERC4626Like {
+
+    function balanceOf(address account) external view returns (uint256);
+
+    function convertToShares(uint256 assets) external view returns (uint256 shares);
+
+    function convertToAssets(uint256 shares) external view returns (uint256 assets);
 
 }
 
@@ -118,6 +398,14 @@ interface IRateLimitsLike {
     function getCurrentRateLimit(bytes32 key) external view returns (uint256);
 
     function hasRole(bytes32 role, address account) external view returns (bool);
+
+}
+
+interface ISafeLike {
+
+    function getOwners() external view returns (address[] memory);
+
+    function getThreshold() external view returns (uint256);
 
 }
 
@@ -175,27 +463,62 @@ interface ISparkVaultV2Like {
 
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
 
-    function setVsr(uint256 vsr) external;
-
 }
 
-interface ITokenBridgeLike {
+interface ITimelockLike {
 
-    function escrow() external returns (address);
+    error EnforcedPause();
 
-}
+    error TimelockUnexpectedOperationState(bytes32 id, bytes32 state);
 
-interface IERC4626Like {
+    event MinDelayChange(uint256 oldDuration, uint256 newDuration);
 
-    function balanceOf(address account) external view returns (uint256);
+    event Paused(address account);
 
-    function deposit(uint256 assets, address receiver) external returns (uint256 shares);
+    function CANCELLER_ROLE() external view returns (bytes32);
 
-    function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
+    function EXECUTOR_ROLE() external view returns (bytes32);
 
-    function convertToShares(uint256 assets) external view returns (uint256 shares);
+    function PAUSER_ROLE() external view returns (bytes32);
 
-    function convertToAssets(uint256 shares) external view returns (uint256 assets);
+    function PROPOSER_ROLE() external view returns (bytes32);
+
+    function executeBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[]   calldata payloads,
+        bytes32            predecessor,
+        bytes32            salt
+    ) external payable;
+
+    function getMinDelay() external view returns (uint256);
+
+    function getOperationsCount() external view returns (uint256);
+
+    function hasRole(bytes32 role, address account) external view returns (bool);
+
+    function hashOperationBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[]   calldata payloads,
+        bytes32            predecessor,
+        bytes32            salt
+    ) external pure returns (bytes32);
+
+    function isOperationReady(bytes32 id) external view returns (bool);
+
+    function paused() external view returns (bool);
+
+    function scheduleBatch(
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[]   calldata payloads,
+        bytes32            predecessor,
+        bytes32            salt,
+        uint256            delay
+    ) external;
+
+    function unpause() external;
 
 }
 
@@ -224,18 +547,66 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
 
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
 
-    // SUSDS transfer amount
-    uint256 internal constant SUSDS_TRANSFER_AMOUNT = 100_000_000e18;
+    // PAS
 
-    // PAS Configurator addreses
+    address internal constant PAS_BEAM_STATE   = 0x11CFefeA67B18de9046a6250555D438854fFEEDa;
+    address internal constant PAS_CBEAM        = 0x492aae70E59551768BAF3c7159d3f951B6ed76Fe;
+    address internal constant PAS_CONFIGURATOR = 0xd11Dc57F3eF23bb7b3142588a461F68460a7C474;
+    address internal constant PAS_CORE_COUNCIL = 0x148eF923d764CBdc1597CcADBbbC66499C1A1432;
+    address internal constant PAS_DEPLOYER     = 0x6547c342ED83b6dEEf9Ac7525fc1196F7Bfa5A4D;
+    address internal constant PAS_TIMELOCK     = 0x66d3653e66F7edb973549CFA3b46F22298B8f983;
 
-    address internal constant PAS_CONFIGURATOR = 0x0000000000000000000000000000000000000000;  // TODO: Add actual address
+    uint8 internal constant PAS_ROLE_DELAYED   = 1;  // BeamState actions routed through the Timelock
+    uint8 internal constant PAS_ROLE_IMMEDIATE = 2;  // BeamState actions the Core Council can call directly
+
+    uint256 internal constant PAS_HOP             = 16 hours;
+    uint256 internal constant PAS_MAX_CHANGE      = 1.2e18;
+    uint256 internal constant TIMELOCK_MIN_DELAY  = 14 days;
+
+    bytes32 internal constant CCTP_FACET_ID = "CCTP_FACET";
 
     // Arbitrum PAU Administered Agent addresses
 
-    address internal constant SPARK_HOT_WALLET       = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
-    address internal constant SOTER_GRANTOR_MULTISIG = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
-    address internal constant SOTER_FREEZER_MULTISIG = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
+    address internal constant SOTER_FREEZER_MULTISIG = 0x747BF29B189e2a070a921Af7Cf65681E3d5F5967;
+    address internal constant SOTER_GRANTOR_MULTISIG = 0x97EC6398e5dD047BA3223cFC017bFC6436Ac3Fe7;
+    address internal constant SPARK_HOT_WALLET       = 0x062cE42caE04c51D04E77e3D64cc8953a2296FfE;
+
+    // Arbitrum -> Ethereum USDS withdrawal dry run: 1 USDS sent to the Ethereum ALM Proxy through the token bridge,
+    // pending in the Arbitrum Outbox at the fork block.
+    // https://arbiscan.io/tx/0x45f159903aa31cd40fdf91219f05c2a839ed75f6139e97c937987d8ecce15d78
+
+    address internal constant ARBITRUM_OUTBOX = 0x0B9857ae2D4A3DBe74ffE1d7DF045bb7F96E4840;
+
+    address internal constant USDS_WITHDRAWAL_FROM = 0xE0E6f7b5DD2FBd9601e61cD2aEDb79d4910B87eF;  // L2 contract that called the token bridge
+
+    uint256 internal constant USDS_WITHDRAWAL_AMOUNT       = 1e18;
+    uint256 internal constant USDS_WITHDRAWAL_INDEX        = 166656;
+    uint256 internal constant USDS_WITHDRAWAL_L2_BLOCK     = 511952606;
+    uint256 internal constant USDS_WITHDRAWAL_L1_BLOCK     = 26126827;
+    uint256 internal constant USDS_WITHDRAWAL_L2_TIMESTAMP = 1791211298;  // Oct-05-2026 14:41:38 +UTC
+
+    bytes32 internal constant USDS_WITHDRAWAL_ITEM_HASH     = 0x2068c0fc9ed0c0366660fbe1fadb1aec4ca7a0a07ad905a3cf2eb5dfad1d6d7b;
+    bytes32 internal constant USDS_WITHDRAWAL_L2_BLOCK_HASH = 0xf957cab4066087ad982b8c278d253b0789ea7152b649cd76f37c0c7fe74670f0;
+    bytes32 internal constant USDS_WITHDRAWAL_SEND_ROOT     = 0xa1130e6165b7fed6a705aedddc50471de6d44f01e2516b90e23e60aa59f1d3c9;  // ArbSys send root with this message as the last leaf
+
+    // Real rollup confirmation replay: the first validator assertion whose range includes the withdrawal was created at
+    // L1 block 26,127,226 and asserts L2 block 511,956,752 with sendCount 166,658, so its send root contains leaf
+    // 166,656. Confirmable from L1 block 26,127,226 + 45,818.
+
+    uint256 internal constant ROLLUP_REPLAY_FORK_BLOCK = 26127560;  // mainnet block after the covering assertion was created
+
+    bytes32 internal constant USDS_WITHDRAWAL_ASSERTION             = 0xc831e52518314953d875ecf733376e44af57910ed8ae7a3022824d8084a405c3;
+    bytes32 internal constant USDS_WITHDRAWAL_ASSERTED_L2_BLOCK_HASH = 0x436ab16ca096367792379913beb26a5209f647bb24e0b78405eaf261c3d6ff02;  // L2 block 511,956,752
+    bytes32 internal constant USDS_WITHDRAWAL_ASSERTED_SEND_ROOT     = 0x1f217600112ffbe304c3d9233835d07d13dd7ff91bb8475738403cdf4d6a49e2;  // its send root, sendCount 166,658
+
+    struct PendingAssertion {
+        bytes32                            hash;
+        IArbitrumRollupLike.AssertionInputs inputs;
+        bytes32                            afterInboxBatchAcc;
+        bool                               exists;
+    }
+
+    mapping(bytes32 parentAssertionHash => PendingAssertion) internal _pendingChildOf;
 
     // XLayer CCTP round trip test setup
 
@@ -256,11 +627,9 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
 
     address internal user;
 
-    uint256 internal constant USDG_BALANCES_SLOT_INDEX = 1;
-
     constructor() {
         _spellId   = 20261008;
-        _blockDate = 1790264363;  // Sep-24-2026 03:39:23 PM +UTC
+        _blockDate = 1791186678;  // Oct-05-2026 07:51:18 +UTC
     }
 
     function setUp() public override {
@@ -281,24 +650,34 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
 
         user = makeAddr("user");
 
-        // chainData[ChainIdUtils.Ethereum()].payload = 0xdE40689816DA168b0A56f8F22CBD7FfCFA403E6B;
+        chainData[ChainIdUtils.ArbitrumOne()].payload = 0xb037C43b433964A2017cd689f535BEb6B0531473;
+        chainData[ChainIdUtils.Ethereum()].payload    = 0x796eE21eb57C8BE71be7F75770f534D249bC555b;
+        chainData[ChainIdUtils.XLayer()].payload      = 0x3c2B7d559Fd4bd17827B49278FCe1c7d55f39311;
     }
 
     // Arbitrum tests
 
     function test_ARBITRUM_sll_removeExcessLiquidity() external onChain(ChainIdUtils.ArbitrumOne()) {
-        uint256 arbUsdsBalanceBefore = IERC20(Arbitrum.USDS).balanceOf(Arbitrum.ALM_PROXY);
+        uint256 arbUsdsAlmProxyBalanceBefore = IERC20(Arbitrum.USDS).balanceOf(Arbitrum.ALM_PROXY);
+        uint256 arbUsdstotalSupplyBefore     = IERC20(Arbitrum.USDS).totalSupply();
 
         chainData[ChainIdUtils.Ethereum()].domain.selectFork();
 
-        uint256 ethUsdsBalanceBefore = IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY);
+        uint256 ethUsdsAlmProxyBalanceBefore = IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY);
+        uint256 ethUsdsTotalSupplyBefore     = IERC20(Ethereum.USDS).totalSupply();
+        uint256 ethUsdsEscrowBalanceBefore   = IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW);
 
         chainData[ChainIdUtils.ArbitrumOne()].domain.selectFork();
 
         RecordedLogs.init();
 
-        assertEq(arbUsdsBalanceBefore, 90_000_000e18);
-        assertEq(ethUsdsBalanceBefore, 0);
+        assertEq(arbUsdstotalSupplyBefore, 99_766_513.932485333089074921e18);
+        assertEq(ethUsdsTotalSupplyBefore, 6_862_536_925.814452062635990450e18);
+
+        assertEq(ethUsdsEscrowBalanceBefore, 99_816_977.997434192938475265e18);
+
+        assertEq(arbUsdsAlmProxyBalanceBefore, 99_326_272.779060900054294080e18);
+        assertEq(ethUsdsAlmProxyBalanceBefore, 0);
 
         assertEq(IERC20(Arbitrum.USDS).allowance(Arbitrum.ALM_PROXY, Arbitrum.TOKEN_BRIDGE), 0);
 
@@ -306,29 +685,302 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
 
         assertEq(IERC20(Arbitrum.USDS).allowance(Arbitrum.ALM_PROXY, Arbitrum.TOKEN_BRIDGE), 0);
 
+        // On Arbitrum burn happens so totalSupply decreases.
+        assertEq(IERC20(Arbitrum.USDS).totalSupply(), arbUsdstotalSupplyBefore - arbUsdsAlmProxyBalanceBefore);
+
         // Arbitrum ALM proxy sent the tokens to the bridge (burned on L2)
         assertEq(IERC20(Arbitrum.USDS).balanceOf(Arbitrum.ALM_PROXY), 0);
 
         // Relay L2->L1
-        ArbitrumBridgeTesting.relayMessagesToSource(chainData[ChainIdUtils.ArbitrumOne()].bridges[0], false);
+        ArbitrumBridgeTesting.relayMessagesToSource(chainData[ChainIdUtils.ArbitrumOne()].bridges[0], true);
+
+        // On Ethereum release happens so no change in supply.
+        assertEq(IERC20(Ethereum.USDS).totalSupply(), ethUsdsTotalSupplyBefore);
+
+        // Ethereum USDS escrow releases the withdrawn tokens
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW), ethUsdsEscrowBalanceBefore - arbUsdsAlmProxyBalanceBefore);
 
         // Ethereum ALM proxy received the withdrawn tokens
-        chainData[ChainIdUtils.Ethereum()].domain.selectFork();
-        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY), ethUsdsBalanceBefore + arbUsdsBalanceBefore);
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY), ethUsdsAlmProxyBalanceBefore + arbUsdsAlmProxyBalanceBefore);
+    }
+
+    function test_ETHEREUM_sll_removeExcessLiquidity_dryRunOutboxExecution() external onChain(ChainIdUtils.Ethereum()) {
+        IArbitrumOutboxLike outbox = IArbitrumOutboxLike(ARBITRUM_OUTBOX);
+
+        // Calldata the L2 token bridge queued for the L1 token bridge (exitNum 0, no call hook data)
+        bytes memory data = abi.encodeCall(
+            IArbitrumL1TokenGatewayLike.finalizeInboundTransfer,
+            (Ethereum.USDS, USDS_WITHDRAWAL_FROM, Ethereum.ALM_PROXY, USDS_WITHDRAWAL_AMOUNT, abi.encode(uint256(0), bytes("")))
+        );
+
+        // NodeInterface.constructOutboxProof(166657, 166656) on Arbitrum
+        bytes32[] memory proof = new bytes32[](18);
+        proof[8]  = 0xa541feeeedadaa832c210be19e86cdd0988cf3a1d37e54868af369abcf3122fb;
+        proof[9]  = 0x4f2209fe045da74cb675e6e2c4afde9630142779c742d9b43bbbff1db013bd70;
+        proof[11] = 0x69d8205feccedfbd40c37d6cee8843c9113954f8501a182e9ffd3fe1477c2ed2;
+        proof[15] = 0x945d56661ece9531516b2ea547e4e61d1115d39273cee57682f7ffcd11a99aba;
+        proof[17] = 0x823b0cf89df544d51c06d647911719752aadbac27b07c3b38a619fdd41fcc517;
+
+        assertEq(
+            outbox.calculateItemHash(
+                Arbitrum.TOKEN_BRIDGE,
+                Ethereum.ARBITRUM_TOKEN_BRIDGE,
+                USDS_WITHDRAWAL_L2_BLOCK,
+                USDS_WITHDRAWAL_L1_BLOCK,
+                USDS_WITHDRAWAL_L2_TIMESTAMP,
+                0,
+                data
+            ),
+            USDS_WITHDRAWAL_ITEM_HASH
+        );
+
+        assertEq(outbox.roots(USDS_WITHDRAWAL_SEND_ROOT), bytes32(0));
+        assertEq(outbox.isSpent(USDS_WITHDRAWAL_INDEX),   false);
+
+        uint256 usdsEscrowBalanceBefore = IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW);
+
+        assertEq(usdsEscrowBalanceBefore,                             99_816_977.997434192938475265e18);
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY), 0);
+
+        // Wait out the challenge period
+        skip(7 days);
+
+        // The fork never sees the rollup confirm the assertion containing this message, so post its send root as the rollup would
+        vm.prank(outbox.rollup());
+        outbox.updateSendRoot(USDS_WITHDRAWAL_SEND_ROOT, USDS_WITHDRAWAL_L2_BLOCK_HASH);
+
+        assertEq(outbox.roots(USDS_WITHDRAWAL_SEND_ROOT), USDS_WITHDRAWAL_L2_BLOCK_HASH);
+
+        vm.expectEmit(ARBITRUM_OUTBOX);
+        emit IArbitrumOutboxLike.OutBoxTransactionExecuted(Ethereum.ARBITRUM_TOKEN_BRIDGE, Arbitrum.TOKEN_BRIDGE, 0, USDS_WITHDRAWAL_INDEX);
+        vm.expectEmit(Ethereum.USDS);
+        emit IERC20.Transfer(Ethereum.ARBITRUM_ESCROW, Ethereum.ALM_PROXY, USDS_WITHDRAWAL_AMOUNT);
+        vm.expectEmit(Ethereum.ARBITRUM_TOKEN_BRIDGE);
+        emit IArbitrumL1TokenGatewayLike.WithdrawalFinalized(Ethereum.USDS, USDS_WITHDRAWAL_FROM, Ethereum.ALM_PROXY, 0, USDS_WITHDRAWAL_AMOUNT);
+
+        outbox.executeTransaction(
+            proof,
+            USDS_WITHDRAWAL_INDEX,
+            Arbitrum.TOKEN_BRIDGE,
+            Ethereum.ARBITRUM_TOKEN_BRIDGE,
+            USDS_WITHDRAWAL_L2_BLOCK,
+            USDS_WITHDRAWAL_L1_BLOCK,
+            USDS_WITHDRAWAL_L2_TIMESTAMP,
+            0,
+            data
+        );
+
+        assertEq(outbox.isSpent(USDS_WITHDRAWAL_INDEX), true);
+
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW), usdsEscrowBalanceBefore - 1e18);
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY),       1e18);
+
+        // Message cannot be replayed
+        vm.expectRevert(abi.encodeWithSelector(IArbitrumOutboxLike.AlreadySpent.selector, USDS_WITHDRAWAL_INDEX));
+        outbox.executeTransaction(
+            proof,
+            USDS_WITHDRAWAL_INDEX,
+            Arbitrum.TOKEN_BRIDGE,
+            Ethereum.ARBITRUM_TOKEN_BRIDGE,
+            USDS_WITHDRAWAL_L2_BLOCK,
+            USDS_WITHDRAWAL_L1_BLOCK,
+            USDS_WITHDRAWAL_L2_TIMESTAMP,
+            0,
+            data
+        );
+    }
+
+    // Same dry run, but without pranking the rollup: every pending assertion since the latest confirmed one is confirmed
+    // through the real `confirmAssertion`, in order, with the data the validators published in `AssertionCreated`, after
+    // rolling the fork past the covering assertion's deadline. The last confirmation is what writes the send root into the
+    // Outbox. The only synthetic input is `block.number`.
+    function test_ETHEREUM_sll_removeExcessLiquidity_dryRunOutboxExecution_replayRollupConfirmations()
+        external onChain(ChainIdUtils.Ethereum())
+    {
+        // The covering assertion does not exist at _blockDate; move the mainnet fork past its creation.
+        chainData[ChainIdUtils.Ethereum()].domain.rollFork(ROLLUP_REPLAY_FORK_BLOCK);
+
+        IArbitrumOutboxLike outbox = IArbitrumOutboxLike(ARBITRUM_OUTBOX);
+        IArbitrumRollupLike rollup = IArbitrumRollupLike(outbox.rollup());
+
+        assertEq(IArbitrumRollupLike.AssertionCreated.selector, 0x901c3aee23cf4478825462caaab375c606ab83516060388344f0650340753630);
+        assertEq(rollup.validatorWhitelistDisabled(), true);  // anyone may call confirmAssertion
+        assertEq(rollup.confirmPeriodBlocks(),        45_818);
+
+        bytes32 latestConfirmed = rollup.latestConfirmed();
+
+        IArbitrumRollupLike.AssertionNode memory covering = rollup.getAssertion(USDS_WITHDRAWAL_ASSERTION);
+
+        assertEq(covering.status,         1);  // Pending
+        assertEq(covering.createdAtBlock, 26127226);
+
+        // 1. Collect every AssertionCreated since the latest confirmed assertion was created (RPC allows 10k blocks per query).
+        bytes32[] memory topics = new bytes32[](1);
+        topics[0] = IArbitrumRollupLike.AssertionCreated.selector;
+
+        uint256 from = rollup.getAssertion(latestConfirmed).createdAtBlock;
+        uint256 created;
+
+        while (from <= ROLLUP_REPLAY_FORK_BLOCK) {
+            uint256 to = from + 9_999 < ROLLUP_REPLAY_FORK_BLOCK ? from + 9_999 : ROLLUP_REPLAY_FORK_BLOCK;
+
+            VmSafe.EthGetLogs[] memory logs = vm.eth_getLogs(from, to, address(rollup), topics);
+
+            for (uint256 i = 0; i < logs.length; i++) {
+                ( IArbitrumRollupLike.AssertionInputs memory inputs, bytes32 afterInboxBatchAcc,,,,, )
+                    = abi.decode(logs[i].data, (IArbitrumRollupLike.AssertionInputs, bytes32, uint256, bytes32, uint256, address, uint64));
+
+                bytes32 parent = logs[i].topics[2];
+
+                assertEq(_pendingChildOf[parent].exists, false, "rival assertion found");
+
+                _pendingChildOf[parent] = PendingAssertion({
+                    hash:               logs[i].topics[1],
+                    inputs:             inputs,
+                    afterInboxBatchAcc: afterInboxBatchAcc,
+                    exists:             true
+                });
+
+                created++;
+            }
+
+            from = to + 1;
+        }
+
+        // 2. Past the deadline of the covering assertion, which is the latest deadline in the chain.
+        vm.roll(covering.createdAtBlock + rollup.confirmPeriodBlocks());
+
+        assertEq(outbox.roots(USDS_WITHDRAWAL_ASSERTED_SEND_ROOT), bytes32(0));
+        assertEq(outbox.isSpent(USDS_WITHDRAWAL_INDEX),              false);
+
+        // 3. Confirm the chain in order, exactly as validators will, until the covering assertion is confirmed.
+        bytes32 current = latestConfirmed;
+        uint256 confirmed;
+
+        while (current != USDS_WITHDRAWAL_ASSERTION) {
+            PendingAssertion storage child = _pendingChildOf[current];
+
+            assertEq(child.exists,                                 true, "gap in assertion chain");
+            assertEq(rollup.getAssertion(current).secondChildBlock, 0,   "unexpected challenge");
+
+            if (child.hash == USDS_WITHDRAWAL_ASSERTION) {
+                // The validator committed to exactly the block hash and send root the proof below was built against.
+                assertEq(child.inputs.afterState.globalState.bytes32Vals[0], USDS_WITHDRAWAL_ASSERTED_L2_BLOCK_HASH);
+                assertEq(child.inputs.afterState.globalState.bytes32Vals[1], USDS_WITHDRAWAL_ASSERTED_SEND_ROOT);
+
+                vm.expectEmit(ARBITRUM_OUTBOX);
+                emit IArbitrumOutboxLike.SendRootUpdated(USDS_WITHDRAWAL_ASSERTED_SEND_ROOT, USDS_WITHDRAWAL_ASSERTED_L2_BLOCK_HASH);
+                vm.expectEmit(address(rollup));
+                emit IArbitrumRollupLike.AssertionConfirmed(USDS_WITHDRAWAL_ASSERTION, USDS_WITHDRAWAL_ASSERTED_L2_BLOCK_HASH, USDS_WITHDRAWAL_ASSERTED_SEND_ROOT);
+            }
+
+            rollup.confirmAssertion(
+                child.hash,
+                current,
+                child.inputs.afterState,
+                bytes32(0),  // no rival, so no winning edge
+                child.inputs.beforeStateData.configData,
+                child.afterInboxBatchAcc
+            );
+
+            assertEq(rollup.latestConfirmed(), child.hash);
+
+            current = child.hash;
+            confirmed++;
+        }
+
+        assertGt(confirmed, 100);           // ~6.4 days of hourly assertions
+        assertLe(confirmed, created);
+
+        assertEq(rollup.getAssertion(USDS_WITHDRAWAL_ASSERTION).status, 2);  // Confirmed
+        assertEq(outbox.roots(USDS_WITHDRAWAL_ASSERTED_SEND_ROOT),       USDS_WITHDRAWAL_ASSERTED_L2_BLOCK_HASH);
+
+        // 4. The claim, against the root the validators put there. NodeInterface.constructOutboxProof(166658, 166656) on Arbitrum.
+        bytes32[] memory proof = new bytes32[](18);
+        proof[0]  = 0x7f954d609deafa7e2cb7e72842bde281b273138c53111bc4a31b2f7018be400d;
+        proof[8]  = 0xa541feeeedadaa832c210be19e86cdd0988cf3a1d37e54868af369abcf3122fb;
+        proof[9]  = 0x4f2209fe045da74cb675e6e2c4afde9630142779c742d9b43bbbff1db013bd70;
+        proof[11] = 0x69d8205feccedfbd40c37d6cee8843c9113954f8501a182e9ffd3fe1477c2ed2;
+        proof[15] = 0x945d56661ece9531516b2ea547e4e61d1115d39273cee57682f7ffcd11a99aba;
+        proof[17] = 0x823b0cf89df544d51c06d647911719752aadbac27b07c3b38a619fdd41fcc517;
+
+        bytes memory data = abi.encodeCall(
+            IArbitrumL1TokenGatewayLike.finalizeInboundTransfer,
+            (Ethereum.USDS, USDS_WITHDRAWAL_FROM, Ethereum.ALM_PROXY, USDS_WITHDRAWAL_AMOUNT, abi.encode(uint256(0), bytes("")))
+        );
+
+        uint256 usdsEscrowBalanceBefore = IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW);
+
+        assertEq(usdsEscrowBalanceBefore,                             99_816_977.997434192938475265e18);
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY), 0);
+
+        vm.expectEmit(Ethereum.ARBITRUM_TOKEN_BRIDGE);
+        emit IArbitrumL1TokenGatewayLike.WithdrawalFinalized(Ethereum.USDS, USDS_WITHDRAWAL_FROM, Ethereum.ALM_PROXY, 0, USDS_WITHDRAWAL_AMOUNT);
+
+        outbox.executeTransaction(
+            proof,
+            USDS_WITHDRAWAL_INDEX,
+            Arbitrum.TOKEN_BRIDGE,
+            Ethereum.ARBITRUM_TOKEN_BRIDGE,
+            USDS_WITHDRAWAL_L2_BLOCK,
+            USDS_WITHDRAWAL_L1_BLOCK,
+            USDS_WITHDRAWAL_L2_TIMESTAMP,
+            0,
+            data
+        );
+
+        assertEq(outbox.isSpent(USDS_WITHDRAWAL_INDEX), true);
+
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ARBITRUM_ESCROW), usdsEscrowBalanceBefore - USDS_WITHDRAWAL_AMOUNT);
+        assertEq(IERC20(Ethereum.USDS).balanceOf(Ethereum.ALM_PROXY),       USDS_WITHDRAWAL_AMOUNT);
+    }
+
+    function test_ARBITRUM_sll_beaconRoleTransfer() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeaconLike beacon = IBeaconLike(Arbitrum.SPARK_BEACON);
+
+        assertEq(beacon.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
+        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
+        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SKY_GOV_RELAY),  false);
+
+        _executeAllPayloadsAndBridges();
+
+        assertEq(beacon.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
+        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), false);
+        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SKY_GOV_RELAY),  true);
+    }
+
+    function test_ARBITRUM_sll_parallelPAU_grantPASConfigurator() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IAccessControlsLike accessControls = IAccessControlsLike(Arbitrum.PAU_ACCESS_CONTROLS);
+        IRateLimitsLike     rateLimits     = IRateLimitsLike(Arbitrum.PAU_RATELIMITS);
+
+        assertEq(accessControls.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
+        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
+        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        false);
+
+        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
+        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        false);
+
+        _executeAllPayloadsAndBridges();
+
+        assertEq(accessControls.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               2);
+        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
+        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        true);
+
+        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
+        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        true);
     }
 
     function test_ARBITRUM_sll_parallelPAU_roles() external onChain(ChainIdUtils.ArbitrumOne()) {
-        bytes32 controllerRole = IALMProxyLike(Arbitrum.ALM_PROXY).CONTROLLER();
 
         IAdministeredAgentLike administeredAgent = IAdministeredAgentLike(Arbitrum.PAU_ADMINISTERED_AGENT);
-        IAccessControlsLike    accessControls    = IAccessControlsLike(Arbitrum.PAU_ACCESS_CONTROLS);
-        IRateLimitsLike        rateLimits        = IRateLimitsLike(Arbitrum.PAU_RATELIMITS);
-        IBeaconLike            beacon            = IBeaconLike(Arbitrum.SPARK_BEACON);
+        IALMProxyLike          almProxy          = IALMProxyLike(Arbitrum.ALM_PROXY);
+
+        bytes32 controllerRole = almProxy.CONTROLLER();
 
         // ALMProxy roles
 
-        assertEq(IALMProxyLike(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.ALM_CONTROLLER), true);
-        assertEq(IALMProxyLike(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.PAU_CONTROLLER), false);
+        assertEq(almProxy.hasRole(controllerRole, Arbitrum.ALM_CONTROLLER), true);
+        assertEq(almProxy.hasRole(controllerRole, Arbitrum.PAU_CONTROLLER), false);
 
         // PAU Administered Agent roles
 
@@ -344,26 +996,12 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         assertEq(administeredAgent.revokerCount(), 1);
         assertEq(administeredAgent.getRevoker(0),  Arbitrum.ALM_FREEZER_MULTISIG);
 
-        // PAS Configurator roles
-
-        assertEq(accessControls.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
-        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
-        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        false);
-
-        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR), false);
-
-        // Beacon
-
-        assertEq(beacon.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
-        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
-        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SKY_GOV_RELAY),  false);
-
         _executeAllPayloadsAndBridges();
 
         // ALMProxy roles
 
-        assertEq(IALMProxyLike(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.ALM_CONTROLLER), true);
-        assertEq(IALMProxyLike(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.PAU_CONTROLLER), true);
+        assertEq(almProxy.hasRole(controllerRole, Arbitrum.ALM_CONTROLLER), true);
+        assertEq(almProxy.hasRole(controllerRole, Arbitrum.PAU_CONTROLLER), true);
 
         // PAU Administered Agent roles
 
@@ -380,20 +1018,60 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         assertEq(administeredAgent.revokerCount(), 2);
         assertEq(administeredAgent.getRevoker(0),  Arbitrum.ALM_FREEZER_MULTISIG);
         assertEq(administeredAgent.getRevoker(1),  SOTER_FREEZER_MULTISIG);
+    }
 
-        // PAS Configurator roles
+    function test_ARBITRUM_sll_parallelPAU_roles_events() external onChain(ChainIdUtils.ArbitrumOne()) {
+        bytes32 controllerRole = IALMProxyLike(Arbitrum.ALM_PROXY).CONTROLLER();
 
-        assertEq(accessControls.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               2);
-        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), true);
-        assertEq(accessControls.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR),        true);
+        vm.recordLogs();
 
-        assertEq(rateLimits.hasRole(DEFAULT_ADMIN_ROLE, PAS_CONFIGURATOR), true);
+        _executeAllPayloadsAndBridges();
 
-        // Beacon
+        Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        assertEq(beacon.getRoleMemberCount(DEFAULT_ADMIN_ROLE),               1);
-        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SPARK_EXECUTOR), false);
-        assertEq(beacon.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SKY_GOV_RELAY),  true);
+        Vm.Log[] memory almProxyLogs   = new Vm.Log[](logs.length);
+        Vm.Log[] memory rateLimitsLogs = new Vm.Log[](logs.length);
+
+        // Get only the RoleGranted and RoleRevoked events from ALMProxy and PAU RateLimits
+        uint256 almProxyCount;
+        uint256 rateLimitsCount;
+
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics.length == 0) continue;
+            if (
+                logs[i].topics[0] != IAccessControl.RoleGranted.selector &&
+                logs[i].topics[0] != IAccessControl.RoleRevoked.selector
+            ) continue;
+
+            if      (logs[i].emitter == Arbitrum.ALM_PROXY)      almProxyLogs[almProxyCount++]     = logs[i];
+            else if (logs[i].emitter == Arbitrum.PAU_RATELIMITS) rateLimitsLogs[rateLimitsCount++] = logs[i];
+        }
+
+        assertEq(almProxyCount,   3);
+        assertEq(rateLimitsCount, 1);
+
+        assertEq(almProxyLogs[0].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(almProxyLogs[0].topics[1],                            controllerRole);
+        assertEq(address(uint160(uint256(almProxyLogs[0].topics[2]))), Arbitrum.PAU_CONTROLLER);
+        assertEq(address(uint160(uint256(almProxyLogs[0].topics[3]))), Arbitrum.SPARK_EXECUTOR);
+
+        assertEq(almProxyLogs[1].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(almProxyLogs[1].topics[1],                            controllerRole);
+        assertEq(address(uint160(uint256(almProxyLogs[1].topics[2]))), Arbitrum.SPARK_EXECUTOR);
+        assertEq(address(uint160(uint256(almProxyLogs[1].topics[3]))), Arbitrum.SPARK_EXECUTOR);
+
+        assertEq(almProxyLogs[2].topics[0],                            IAccessControl.RoleRevoked.selector);
+        assertEq(almProxyLogs[2].topics[1],                            controllerRole);
+        assertEq(address(uint160(uint256(almProxyLogs[2].topics[2]))), Arbitrum.SPARK_EXECUTOR);
+        assertEq(address(uint160(uint256(almProxyLogs[2].topics[3]))), Arbitrum.SPARK_EXECUTOR);
+
+        assertEq(rateLimitsLogs[0].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(rateLimitsLogs[0].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(rateLimitsLogs[0].topics[2]))), PAS_CONFIGURATOR);
+        assertEq(address(uint160(uint256(rateLimitsLogs[0].topics[3]))), Arbitrum.SPARK_EXECUTOR);
+
+        assertEq(IAccessControl(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.PAU_CONTROLLER), true);
+        assertEq(IAccessControl(Arbitrum.ALM_PROXY).hasRole(controllerRole, Arbitrum.SPARK_EXECUTOR), false);
     }
 
     function test_ARBITRUM_sll_pauCctpV2_onboarding() external onChain(ChainIdUtils.ArbitrumOne()) {
@@ -428,7 +1106,781 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         assertEq(maxFeeCapRate, 0);
     }
 
+    function test_ARBITRUM_sll_pauCctpV2_rateLimitEnforced() external onChain(ChainIdUtils.ArbitrumOne()) {
+        _executeAllPayloadsAndBridges();
+
+        vm.prank(Arbitrum.ALM_RELAYER_MULTISIG);
+        vm.expectRevert("RateLimits/rate-limit-exceeded");
+        IAdministeredAgentLike(Arbitrum.PAU_ADMINISTERED_AGENT).call(
+            Arbitrum.PAU_CONTROLLER,
+            abi.encodeCall(IForeignControllerFullLike.cctp_transfer, (5_000_000e6 + 1, CCTP_V2_DOMAIN_ID_ETHEREUM, 0))
+        );
+    }
+
+    function test_ARBITRUM_pasConfigurator_state() external onChain(ChainIdUtils.ArbitrumOne()) {
+        assertEq(IConfiguratorLike(PAS_CONFIGURATOR).beamState(), PAS_BEAM_STATE);
+    }
+
+    function test_ARBITRUM_beamState_stopped() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.stopped(), false);
+
+        VmSafe.EthGetLogs[] memory startLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.Start.selector);
+        VmSafe.EthGetLogs[] memory stopLogs  = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.Stop.selector);
+
+        assertEq(startLogs.length, 0);
+        assertEq(stopLogs.length,  0);
+    }
+
+    function test_ARBITRUM_beamState_wards() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        // BeamState admin: Sky governance only
+
+        assertEq(beamState.wards(Arbitrum.SKY_GOV_RELAY), 1);
+        assertEq(beamState.wards(PAS_DEPLOYER),           0);
+
+        VmSafe.EthGetLogs[] memory relyLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.Rely.selector);
+        VmSafe.EthGetLogs[] memory denyLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.Deny.selector);
+
+        assertEq(relyLogs.length, 2);
+        assertEq(denyLogs.length, 1);
+
+        assertEq(relyLogs[0].topics[0],                            IBeamStateLike.Rely.selector);
+        assertEq(address(uint160(uint256(relyLogs[0].topics[1]))), PAS_DEPLOYER);
+
+        assertEq(relyLogs[1].topics[0],                            IBeamStateLike.Rely.selector);
+        assertEq(address(uint160(uint256(relyLogs[1].topics[1]))), Arbitrum.SKY_GOV_RELAY);
+
+        assertEq(denyLogs[0].topics[0],                            IBeamStateLike.Deny.selector);
+        assertEq(address(uint160(uint256(denyLogs[0].topics[1]))), PAS_DEPLOYER);
+    }
+
+    function test_ARBITRUM_beamState_userRoles() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        // BeamState user roles: Timelock has delayed role, Core Council has immediate role.
+
+        assertEq(beamState.hasUserRole(PAS_TIMELOCK,     PAS_ROLE_DELAYED),   true);
+        assertEq(beamState.hasUserRole(PAS_CORE_COUNCIL, PAS_ROLE_DELAYED),   false);
+
+        assertEq(beamState.hasUserRole(PAS_TIMELOCK,     PAS_ROLE_IMMEDIATE), false);
+        assertEq(beamState.hasUserRole(PAS_CORE_COUNCIL, PAS_ROLE_IMMEDIATE), true);
+
+        VmSafe.EthGetLogs[] memory userRoleLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetUserRole.selector);
+
+        assertEq(userRoleLogs.length, 2);
+
+        assertEq(userRoleLogs[0].topics[0],                            IBeamStateLike.SetUserRole.selector);
+        assertEq(address(uint160(uint256(userRoleLogs[0].topics[1]))), PAS_TIMELOCK);
+        assertEq(uint8(uint256(userRoleLogs[0].topics[2])),            PAS_ROLE_DELAYED);
+        assertEq(abi.decode(userRoleLogs[0].data, (bool)),             true);
+
+        assertEq(userRoleLogs[1].topics[0],                            IBeamStateLike.SetUserRole.selector);
+        assertEq(address(uint160(uint256(userRoleLogs[1].topics[1]))), PAS_CORE_COUNCIL);
+        assertEq(uint8(uint256(userRoleLogs[1].topics[2])),            PAS_ROLE_IMMEDIATE);
+        assertEq(abi.decode(userRoleLogs[1].data, (bool)),             true);
+    }
+
+    function test_ARBITRUM_beamState_actionRoles() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        // BeamState action roles
+
+        bytes4[18] memory actionSigs = [  // First 8 are for DELAYED role, next 10 are for IMMEDIATE role.
+            IBeamStateLike.start.selector,
+            IBeamStateLike.setHop.selector,
+            IBeamStateLike.setMaxChange.selector,
+            IBeamStateLike.addRateLimits.selector,
+            IBeamStateLike.addController.selector,
+            IBeamStateLike.addCBeam.selector,
+            IBeamStateLike.addInitRateLimits.selector,
+            IBeamStateLike.addInitControllerActions.selector,
+            IBeamStateLike.stop.selector,
+            IBeamStateLike.delRateLimits.selector,
+            IBeamStateLike.delController.selector,
+            IBeamStateLike.delCBeam.selector,
+            IBeamStateLike.setCBeamForRateLimits.selector,
+            IBeamStateLike.unsetCBeamForRateLimits.selector,
+            IBeamStateLike.setCBeamForController.selector,
+            IBeamStateLike.unsetCBeamForController.selector,
+            IBeamStateLike.delInitRateLimits.selector,
+            IBeamStateLike.delInitControllerActions.selector
+        ];
+
+        VmSafe.EthGetLogs[] memory roleActionLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetRoleAction.selector);
+
+        assertEq(roleActionLogs.length, 18);
+
+        // First 8 actions are for DELAYED role
+        for (uint256 i = 0; i < 8; i++) {
+            assertEq(beamState.actionsRoles(actionSigs[i]), bytes32(uint256(1) << PAS_ROLE_DELAYED));
+
+            assertEq(roleActionLogs[i].topics[0],                 IBeamStateLike.SetRoleAction.selector);
+            assertEq(uint8(uint256(roleActionLogs[i].topics[1])), PAS_ROLE_DELAYED);
+            assertEq(roleActionLogs[i].topics[2],                 bytes32(actionSigs[i]));
+            assertEq(abi.decode(roleActionLogs[i].data, (bool)),  true);
+        }
+
+        // Next 10 actions are for IMMEDIATE role
+        for (uint256 i = 8; i < 18; i++) {
+            assertEq(beamState.actionsRoles(actionSigs[i]), bytes32(uint256(1) << PAS_ROLE_IMMEDIATE));
+
+            assertEq(roleActionLogs[i].topics[0],                 IBeamStateLike.SetRoleAction.selector);
+            assertEq(uint8(uint256(roleActionLogs[i].topics[1])), PAS_ROLE_IMMEDIATE);
+            assertEq(roleActionLogs[i].topics[2],                 bytes32(actionSigs[i]));
+            assertEq(abi.decode(roleActionLogs[i].data, (bool)),  true);
+        }
+    }
+
+    function test_ARBITRUM_beamState_rateLimits() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.rateLimits(Arbitrum.PAU_RATELIMITS), 1);
+
+        VmSafe.EthGetLogs[] memory addRateLimitsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.AddRateLimits.selector);
+        VmSafe.EthGetLogs[] memory delRateLimitsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.DelRateLimits.selector);
+
+        assertEq(addRateLimitsLogs.length, 1);
+        assertEq(delRateLimitsLogs.length, 0);
+
+        assertEq(addRateLimitsLogs[0].topics[0],                            IBeamStateLike.AddRateLimits.selector);
+        assertEq(address(uint160(uint256(addRateLimitsLogs[0].topics[1]))), Arbitrum.PAU_RATELIMITS);
+    }
+
+    function test_ARBITRUM_beamState_controllers() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.controllers(Arbitrum.PAU_CONTROLLER), 1);
+
+        VmSafe.EthGetLogs[] memory addControllerLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.AddController.selector);
+        VmSafe.EthGetLogs[] memory delControllerLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.DelController.selector);
+
+        assertEq(addControllerLogs.length, 1);
+        assertEq(delControllerLogs.length, 0);
+
+        assertEq(addControllerLogs[0].topics[0],                            IBeamStateLike.AddController.selector);
+        assertEq(address(uint160(uint256(addControllerLogs[0].topics[1]))), Arbitrum.PAU_CONTROLLER);
+    }
+
+    function test_ARBITRUM_beamState_cBeams() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.cBeams(PAS_CBEAM), 1);
+
+        VmSafe.EthGetLogs[] memory addCBeamLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.AddCBeam.selector);
+        VmSafe.EthGetLogs[] memory delCBeamLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.DelCBeam.selector);
+
+        assertEq(addCBeamLogs.length, 1);
+        assertEq(delCBeamLogs.length, 0);
+
+        assertEq(addCBeamLogs[0].topics[0],                            IBeamStateLike.AddCBeam.selector);
+        assertEq(address(uint160(uint256(addCBeamLogs[0].topics[1]))), PAS_CBEAM);
+    }
+
+    function test_ARBITRUM_beamState_rateLimitsCBeams() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.rateLimitsCBeams(Arbitrum.PAU_RATELIMITS, PAS_CBEAM), 1);
+
+        VmSafe.EthGetLogs[] memory setCBeamForRateLimitsLogs   = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetCBeamForRateLimits.selector);
+        VmSafe.EthGetLogs[] memory unsetCBeamForRateLimitsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.UnsetCBeamForRateLimits.selector);
+
+        assertEq(setCBeamForRateLimitsLogs.length,   1);
+        assertEq(unsetCBeamForRateLimitsLogs.length, 0);
+
+        assertEq(setCBeamForRateLimitsLogs[0].topics[0],                            IBeamStateLike.SetCBeamForRateLimits.selector);
+        assertEq(address(uint160(uint256(setCBeamForRateLimitsLogs[0].topics[1]))), Arbitrum.PAU_RATELIMITS);
+        assertEq(address(uint160(uint256(setCBeamForRateLimitsLogs[0].topics[2]))), PAS_CBEAM);
+    }
+
+    function test_ARBITRUM_beamState_controllersCBeams() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.controllersCBeams(Arbitrum.PAU_CONTROLLER, PAS_CBEAM), 1);
+
+        VmSafe.EthGetLogs[] memory setCBeamForControllerLogs   = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetCBeamForController.selector);
+        VmSafe.EthGetLogs[] memory unsetCBeamForControllerLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.UnsetCBeamForController.selector);
+
+        assertEq(setCBeamForControllerLogs.length,   1);
+        assertEq(unsetCBeamForControllerLogs.length, 0);
+
+        assertEq(setCBeamForControllerLogs[0].topics[0],                            IBeamStateLike.SetCBeamForController.selector);
+        assertEq(address(uint160(uint256(setCBeamForControllerLogs[0].topics[1]))), Arbitrum.PAU_CONTROLLER);
+        assertEq(address(uint160(uint256(setCBeamForControllerLogs[0].topics[2]))), PAS_CBEAM);
+    }
+
+    function test_ARBITRUM_beamState_initRateLimits() external onChain(ChainIdUtils.ArbitrumOne()) {
+        VmSafe.EthGetLogs[] memory addInitRateLimitsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.AddInitRateLimits.selector);
+        VmSafe.EthGetLogs[] memory delInitRateLimitsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.DelInitRateLimits.selector);
+
+        assertEq(addInitRateLimitsLogs.length, 0);
+        assertEq(delInitRateLimitsLogs.length, 0);
+    }
+
+    function test_ARBITRUM_beamState_initControllerActions() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike  beamState  = IBeamStateLike(PAS_BEAM_STATE);
+        IControllerLike controller = IControllerLike(Arbitrum.PAU_CONTROLLER);
+
+        // The only pre-approved controller action is removing the CCTP facet
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CCTP_FACET_ID;
+
+        assertEq(beamState.isControllerActionEnabled(keccak256(abi.encodeCall(controller.removeIntegrations, (ids))), Arbitrum.PAU_CONTROLLER), true);
+
+        VmSafe.EthGetLogs[] memory addInitControllerActionsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.AddInitControllerActions.selector);
+        VmSafe.EthGetLogs[] memory delInitControllerActionsLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.DelInitControllerActions.selector);
+
+        assertEq(addInitControllerActionsLogs.length, 1);
+        assertEq(delInitControllerActionsLogs.length, 0);
+
+        assertEq(addInitControllerActionsLogs[0].topics[0],                            IBeamStateLike.AddInitControllerActions.selector);
+        assertEq(addInitControllerActionsLogs[0].topics[1],                            bytes32(keccak256(abi.encodeCall(controller.removeIntegrations, (ids)))));
+        assertEq(address(uint160(uint256(addInitControllerActionsLogs[0].topics[2]))), Arbitrum.PAU_CONTROLLER);
+    }
+
+    function test_ARBITRUM_beamState_hop() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.hop(address(0)),              PAS_HOP);
+        assertEq(beamState.hop(Arbitrum.PAU_RATELIMITS), 0);
+
+        assertEq(beamState.getHop(address(0)),              PAS_HOP);
+        assertEq(beamState.getHop(Arbitrum.PAU_RATELIMITS), PAS_HOP);
+
+        VmSafe.EthGetLogs[] memory setHopLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetHop.selector);
+
+        assertEq(setHopLogs.length, 1);
+        assertEq(setHopLogs[0].topics[0],                            IBeamStateLike.SetHop.selector);
+        assertEq(address(uint160(uint256(setHopLogs[0].topics[1]))), address(0));  // Zero address for default
+        assertEq(abi.decode(setHopLogs[0].data, (uint256)),          PAS_HOP);
+    }
+
+    function test_ARBITRUM_beamState_maxChange() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        assertEq(beamState.maxChange(address(0)),              PAS_MAX_CHANGE);
+        assertEq(beamState.maxChange(Arbitrum.PAU_RATELIMITS), 0);
+
+        assertEq(beamState.getMaxChange(address(0)),              PAS_MAX_CHANGE);
+        assertEq(beamState.getMaxChange(Arbitrum.PAU_RATELIMITS), PAS_MAX_CHANGE);
+
+        VmSafe.EthGetLogs[] memory setMaxChangeLogs = _getEvents(block.chainid, PAS_BEAM_STATE, IBeamStateLike.SetMaxChange.selector);
+
+        assertEq(setMaxChangeLogs.length, 1);
+        assertEq(setMaxChangeLogs[0].topics[0],                            IBeamStateLike.SetMaxChange.selector);
+        assertEq(address(uint160(uint256(setMaxChangeLogs[0].topics[1]))), address(0));  // Zero address for default
+        assertEq(abi.decode(setMaxChangeLogs[0].data, (uint256)),          PAS_MAX_CHANGE);
+    }
+
+    function test_ARBITRUM_timelock_state() external onChain(ChainIdUtils.ArbitrumOne()) {
+        ITimelockLike timelock = ITimelockLike(PAS_TIMELOCK);
+
+        assertEq(timelock.getMinDelay(),        TIMELOCK_MIN_DELAY);
+        assertEq(timelock.paused(),             true);
+        assertEq(timelock.getOperationsCount(), 0);
+
+        assertEq(timelock.hasRole(DEFAULT_ADMIN_ROLE, Arbitrum.SKY_GOV_RELAY), true);
+        assertEq(timelock.hasRole(DEFAULT_ADMIN_ROLE, PAS_DEPLOYER),           false);
+
+        assertEq(timelock.hasRole(timelock.PROPOSER_ROLE(),  PAS_CORE_COUNCIL), true);
+        assertEq(timelock.hasRole(timelock.CANCELLER_ROLE(), PAS_CORE_COUNCIL), true);
+        assertEq(timelock.hasRole(timelock.EXECUTOR_ROLE(),  address(0)),       true);  // Anyone can execute
+
+        assertEq(timelock.hasRole(timelock.PAUSER_ROLE(), PAS_DEPLOYER), false);
+    }
+
+    function test_ARBITRUM_timelock_events() external onChain(ChainIdUtils.ArbitrumOne()) {
+        ITimelockLike timelock = ITimelockLike(PAS_TIMELOCK);
+
+        bytes32 pauserRole = timelock.PAUSER_ROLE();
+
+        VmSafe.EthGetLogs[] memory allEvents = _getEvents(block.chainid, PAS_TIMELOCK, bytes32(0));
+
+        assertEq(allEvents.length, 12);
+
+        assertEq(allEvents[0].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[0].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(allEvents[0].topics[2]))), PAS_TIMELOCK);
+        assertEq(address(uint160(uint256(allEvents[0].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[1].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[1].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(allEvents[1].topics[2]))), PAS_DEPLOYER);
+        assertEq(address(uint160(uint256(allEvents[1].topics[3]))), PAS_DEPLOYER);
+
+        ( uint256 oldDuration, uint256 newDuration ) = abi.decode(allEvents[2].data, (uint256, uint256));
+
+        assertEq(allEvents[2].topics[0], ITimelockLike.MinDelayChange.selector);
+        assertEq(oldDuration,            0);
+        assertEq(newDuration,            TIMELOCK_MIN_DELAY);
+
+        assertEq(allEvents[3].topics[0],                            IAccessControl.RoleRevoked.selector);
+        assertEq(allEvents[3].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(allEvents[3].topics[2]))), PAS_TIMELOCK);
+        assertEq(address(uint160(uint256(allEvents[3].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[4].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[4].topics[1],                            timelock.EXECUTOR_ROLE());
+        assertEq(address(uint160(uint256(allEvents[4].topics[2]))), address(0));  // Anyone can execute
+        assertEq(address(uint160(uint256(allEvents[4].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[5].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[5].topics[1],                            timelock.PROPOSER_ROLE());
+        assertEq(address(uint160(uint256(allEvents[5].topics[2]))), PAS_CORE_COUNCIL);
+        assertEq(address(uint160(uint256(allEvents[5].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[6].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[6].topics[1],                            timelock.CANCELLER_ROLE());
+        assertEq(address(uint160(uint256(allEvents[6].topics[2]))), PAS_CORE_COUNCIL);
+        assertEq(address(uint160(uint256(allEvents[6].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[7].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[7].topics[1],                            pauserRole);
+        assertEq(address(uint160(uint256(allEvents[7].topics[2]))), PAS_DEPLOYER);
+        assertEq(address(uint160(uint256(allEvents[7].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[8].topics[0],                   ITimelockLike.Paused.selector);
+        assertEq(abi.decode(allEvents[8].data, (address)), PAS_DEPLOYER);
+
+        assertEq(allEvents[9].topics[0],                            IAccessControl.RoleRevoked.selector);
+        assertEq(allEvents[9].topics[1],                            pauserRole);
+        assertEq(address(uint160(uint256(allEvents[9].topics[2]))), PAS_DEPLOYER);
+        assertEq(address(uint160(uint256(allEvents[9].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[10].topics[0],                            IAccessControl.RoleGranted.selector);
+        assertEq(allEvents[10].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(allEvents[10].topics[2]))), Arbitrum.SKY_GOV_RELAY);
+        assertEq(address(uint160(uint256(allEvents[10].topics[3]))), PAS_DEPLOYER);
+
+        assertEq(allEvents[11].topics[0],                            IAccessControl.RoleRevoked.selector);
+        assertEq(allEvents[11].topics[1],                            DEFAULT_ADMIN_ROLE);
+        assertEq(address(uint160(uint256(allEvents[11].topics[2]))), PAS_DEPLOYER);
+        assertEq(address(uint160(uint256(allEvents[11].topics[3]))), PAS_DEPLOYER);
+    }
+
+    // setHop is a DELAYED action: it has to go through the Timelock, the Core Council cannot call it directly
+    function test_ARBITRUM_beamState_setHop_onlyTimelock() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+        ITimelockLike  timelock  = ITimelockLike(PAS_TIMELOCK);
+
+        assertEq(beamState.actionsRoles(IBeamStateLike.setHop.selector), bytes32(uint256(1) << PAS_ROLE_DELAYED));
+
+        vm.prank(PAS_CORE_COUNCIL);
+        vm.expectRevert("BeamState/role-not-authorized");
+        beamState.setHop(Arbitrum.PAU_RATELIMITS, 1 hours);
+
+        assertEq(beamState.getHop(Arbitrum.PAU_RATELIMITS), PAS_HOP);
+
+        // The Core Council proposes the same call through the Timelock
+        address[] memory targets  = new address[](1);
+        uint256[] memory values   = new uint256[](1);
+        bytes[]   memory payloads = new bytes[](1);
+
+        targets[0]  = PAS_BEAM_STATE;
+        payloads[0] = abi.encodeCall(beamState.setHop, (Arbitrum.PAU_RATELIMITS, 1 hours));
+
+        bytes32 id = timelock.hashOperationBatch(targets, values, payloads, bytes32(0), bytes32(0));
+
+        // Assert scheduleBatch reverts before unpausing.
+        vm.expectRevert(ITimelockLike.EnforcedPause.selector);
+        vm.prank(PAS_CORE_COUNCIL);
+        timelock.scheduleBatch(targets, values, payloads, bytes32(0), bytes32(0), TIMELOCK_MIN_DELAY);
+
+        // Unpause the Timelock
+        assertEq(timelock.paused(), true);
+
+        vm.prank(Arbitrum.SKY_GOV_RELAY);
+        timelock.unpause();
+
+        assertEq(timelock.paused(), false);
+
+        // The Core Council schedules the call through the Timelock
+        vm.prank(PAS_CORE_COUNCIL);
+        timelock.scheduleBatch(targets, values, payloads, bytes32(0), bytes32(0), TIMELOCK_MIN_DELAY);
+
+        assertEq(timelock.isOperationReady(id), false);
+
+        // Skip to just before the delay. The operation is still Waiting.
+        skip(TIMELOCK_MIN_DELAY - 1);
+
+        // Still Waiting. execute requires Ready, encoded as bit 2 (1 << OperationState.Ready).
+        vm.expectRevert(abi.encodeWithSelector(
+            ITimelockLike.TimelockUnexpectedOperationState.selector,
+            id,
+            bytes32(uint256(1 << 2))
+        ));
+        timelock.executeBatch(targets, values, payloads, bytes32(0), bytes32(0));
+
+        // Skip to the end of the delay
+        skip(1);
+
+        assertEq(timelock.isOperationReady(id), true);
+
+        assertEq(beamState.getHop(Arbitrum.PAU_RATELIMITS), PAS_HOP);
+        assertEq(beamState.getHop(address(0)),              PAS_HOP);
+
+        // Execution is permissionless, the Timelock is the caller into BeamState
+        timelock.executeBatch(targets, values, payloads, bytes32(0), bytes32(0));
+
+        assertEq(beamState.getHop(Arbitrum.PAU_RATELIMITS), 1 hours);
+        assertEq(beamState.getHop(address(0)),              PAS_HOP);  // Default is untouched
+    }
+
+    function test_ARBITRUM_beamState_delCBeam_onlyCouncil() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike beamState = IBeamStateLike(PAS_BEAM_STATE);
+
+        // delCBeam is an IMMEDIATE action: the Core Council calls it directly, the Timelock is not authorized
+        assertEq(beamState.actionsRoles(IBeamStateLike.delCBeam.selector), bytes32(uint256(1) << PAS_ROLE_IMMEDIATE));
+
+        assertEq(beamState.cBeams(PAS_CBEAM), 1);
+
+        // The Timelock only holds the DELAYED role, so it cannot call it
+        vm.prank(PAS_TIMELOCK);
+        vm.expectRevert("BeamState/role-not-authorized");
+        beamState.delCBeam(PAS_CBEAM);
+
+        assertEq(beamState.cBeams(PAS_CBEAM), 1);
+
+        // The Core Council removes the cBEAM directly, with no delay
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.delCBeam(PAS_CBEAM);
+
+        assertEq(beamState.cBeams(PAS_CBEAM), 0);
+    }
+
+    function test_ARBITRUM_beamState_unsetCBeam_revokesConfiguratorAccess() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike    beamState    = IBeamStateLike(PAS_BEAM_STATE);
+        IConfiguratorLike configurator = IConfiguratorLike(PAS_CONFIGURATOR);
+        IControllerLike   controller   = IControllerLike(Arbitrum.PAU_CONTROLLER);
+
+        bytes32 toDomainKey = controller.cctp_getToDomainRateLimitKey(CCTP_V2_DOMAIN_ID_ETHEREUM);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CCTP_FACET_ID;
+
+        bytes memory removeCctpFacet = abi.encodeCall(controller.removeIntegrations, (ids));
+
+        _executeAllPayloadsAndBridges();
+
+        // Assert both unsetCBeamForRateLimits and unsetCBeamForController are IMMEDIATE and that the Timelock's calls to each revert
+
+        assertEq(beamState.actionsRoles(IBeamStateLike.unsetCBeamForRateLimits.selector), bytes32(uint256(1) << PAS_ROLE_IMMEDIATE));
+        assertEq(beamState.actionsRoles(IBeamStateLike.unsetCBeamForController.selector), bytes32(uint256(1) << PAS_ROLE_IMMEDIATE));
+
+        vm.expectRevert("BeamState/role-not-authorized");
+        vm.prank(PAS_TIMELOCK);
+        beamState.unsetCBeamForRateLimits(Arbitrum.PAU_RATELIMITS, PAS_CBEAM);
+
+        vm.expectRevert("BeamState/role-not-authorized");
+        vm.prank(PAS_TIMELOCK);
+        beamState.unsetCBeamForController(Arbitrum.PAU_CONTROLLER, PAS_CBEAM);
+
+        // cBEAM still succeeds with setRateLimit after delCBeam
+
+        assertEq(beamState.cBeams(PAS_CBEAM),                                     1);
+        assertEq(beamState.rateLimitsCBeams(Arbitrum.PAU_RATELIMITS, PAS_CBEAM),  1);
+        assertEq(beamState.controllersCBeams(Arbitrum.PAU_CONTROLLER, PAS_CBEAM), 1);
+
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.delCBeam(PAS_CBEAM);
+
+        assertEq(beamState.cBeams(PAS_CBEAM),                                     0);
+        assertEq(beamState.rateLimitsCBeams(Arbitrum.PAU_RATELIMITS, PAS_CBEAM),  1);
+        assertEq(beamState.controllersCBeams(Arbitrum.PAU_CONTROLLER, PAS_CBEAM), 1);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 5_000_000e6, uint256(50_000_000e6) / 1 days);
+
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 1_000_000e6, uint256(1_000_000e6) / 1 days);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 1_000_000e6, uint256(1_000_000e6) / 1 days);
+
+        // The Core Council unsets the cBEAM on the rate limits: setRateLimit is rejected
+
+        assertEq(beamState.rateLimitsCBeams(Arbitrum.PAU_RATELIMITS, PAS_CBEAM), 1);
+
+        vm.expectEmit(PAS_BEAM_STATE);
+        emit IBeamStateLike.UnsetCBeamForRateLimits(Arbitrum.PAU_RATELIMITS, PAS_CBEAM);
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.unsetCBeamForRateLimits(Arbitrum.PAU_RATELIMITS, PAS_CBEAM);
+
+        assertEq(beamState.rateLimitsCBeams(Arbitrum.PAU_RATELIMITS, PAS_CBEAM), 0);
+
+        vm.expectRevert("Configurator/not-authorized-ratelimits-cBeam");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 500_000e6, uint256(500_000e6) / 1 days);
+
+        // Rate limit left as the cBEAM last set it
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 1_000_000e6, uint256(1_000_000e6) / 1 days);
+
+        // The Core Council unsets the cBEAM on the controller: callControllerAction is rejected
+
+        assertEq(beamState.controllersCBeams(Arbitrum.PAU_CONTROLLER, PAS_CBEAM), 1);
+
+        vm.expectEmit(PAS_BEAM_STATE);
+        emit IBeamStateLike.UnsetCBeamForController(Arbitrum.PAU_CONTROLLER, PAS_CBEAM);
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.unsetCBeamForController(Arbitrum.PAU_CONTROLLER, PAS_CBEAM);
+
+        assertEq(beamState.controllersCBeams(Arbitrum.PAU_CONTROLLER, PAS_CBEAM), 0);
+
+        vm.expectRevert("Configurator/not-authorized-controller-cBeam");
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+    }
+
+    function test_ARBITRUM_pasConfigurator_setRateLimit() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IConfiguratorLike configurator = IConfiguratorLike(PAS_CONFIGURATOR);
+        IControllerLike   controller   = IControllerLike(Arbitrum.PAU_CONTROLLER);
+
+        bytes32 toCctpKey   = controller.cctp_toCCTPRateLimitKey();
+        bytes32 toDomainKey = controller.cctp_getToDomainRateLimitKey(CCTP_V2_DOMAIN_ID_ETHEREUM);
+
+        // PAS Configurator is not admin on the PAU RateLimits, therefore this reverts
+        vm.expectRevert(abi.encodeWithSelector(
+            IAccessControl.AccessControlUnauthorizedAccount.selector,
+            PAS_CONFIGURATOR,
+            DEFAULT_ADMIN_ROLE
+        ));
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 0, 0);
+
+        _executeAllPayloadsAndBridges();
+
+        _assertUnlimitedRateLimit(Arbitrum.PAU_RATELIMITS, toCctpKey);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 5_000_000e6, uint256(50_000_000e6) / 1 days);
+
+        // Only the cBEAM can go through the Configurator
+        vm.expectRevert("Configurator/not-authorized-ratelimits-cBeam");
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 0, 0);
+
+        // CBeam can only set rate limits for keys that are already registered
+        vm.expectRevert("Configurator/exceeds-max-amount");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, keccak256("NEW_KEY"), 1, 0);
+
+        // If the key is unlimited, the configurator cannot set it to a limited amount
+        vm.expectRevert("Configurator/unlimited-incorrect-params");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toCctpKey, 1_000_000e6, 0);
+
+        // Setting the cctp -> CCTP rate limit to unlimited works
+        vm.expectEmit(address(configurator));
+        emit IConfiguratorLike.SetRateLimit(Arbitrum.PAU_RATELIMITS, toCctpKey, type(uint256).max, 0);
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toCctpKey, type(uint256).max, 0);
+
+        _assertUnlimitedRateLimit(Arbitrum.PAU_RATELIMITS, toCctpKey);
+
+        assertEq(configurator.zzz(Arbitrum.PAU_RATELIMITS, toDomainKey), 0);
+
+        // Decreases apply immediately and do not consume the hop
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 1_000_000e6, uint256(10_000_000e6) / 1 days);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 1_000_000e6, uint256(10_000_000e6) / 1 days, 1_000_000e6, block.timestamp);
+
+        assertEq(configurator.zzz(Arbitrum.PAU_RATELIMITS, toDomainKey), 0);
+
+        // Increases are capped at maxChange (1.2x) of the current values
+        uint256 maxAmountCeiling = 1_000_000e6 * PAS_MAX_CHANGE / 1e18;
+        uint256 slopeCeiling     = uint256(10_000_000e6) / 1 days * PAS_MAX_CHANGE / 1e18;
+
+        vm.expectRevert("Configurator/exceeds-max-amount");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling + 1, slopeCeiling);
+
+        vm.expectRevert("Configurator/exceeds-max-slope");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling, slopeCeiling + 1);
+
+        // First increase is allowed right away (hop timer starts at 0)
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling, slopeCeiling);
+
+        assertEq(configurator.zzz(Arbitrum.PAU_RATELIMITS, toDomainKey), block.timestamp);
+
+        // Next increase has to wait for the hop
+        vm.expectRevert("Configurator/increment-too-soon");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling + 1, slopeCeiling);
+
+        skip(PAS_HOP - 1);
+
+        vm.expectRevert("Configurator/increment-too-soon");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling + 1, slopeCeiling);
+
+        skip(1);
+
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, maxAmountCeiling + 1, slopeCeiling);
+
+        assertEq(configurator.zzz(Arbitrum.PAU_RATELIMITS, toDomainKey), block.timestamp);
+    }
+
+    function test_ARBITRUM_sll_pasConfigurator_callControllerAction() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IConfiguratorLike configurator = IConfiguratorLike(PAS_CONFIGURATOR);
+        IControllerLike   controller   = IControllerLike(Arbitrum.PAU_CONTROLLER);
+        IBeaconLike       beacon       = IBeaconLike(Arbitrum.SPARK_BEACON);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CCTP_FACET_ID;
+
+        // The only pre-approved action is removing the CCTP facet from the PAU Controller (emergency stop)
+        bytes memory removeCctpFacet = abi.encodeCall(controller.removeIntegrations, (ids));
+
+        // Configurator is not admin on the PAU AccessControls yet, so the controller rejects it
+        vm.expectRevert("Configurator/call-failed");
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+
+        _executeAllPayloadsAndBridges();
+
+        IControllerLike.Integration[] memory integrations = controller.integrations();
+
+        assertEq(integrations.length,                 1);
+        assertEq(integrations[0].id,                  CCTP_FACET_ID);
+        assertEq(integrations[0].config.facet,        Arbitrum.CCTP_FACET);
+        assertEq(integrations[0].config.wires.length, 10);
+
+        assertEq(controller.getDispatch(IForeignControllerFullLike.cctp_transfer.selector).facet, Arbitrum.CCTP_FACET);
+        assertEq(beacon.getDispatch(IForeignControllerFullLike.cctp_transfer.selector).facet,     Arbitrum.CCTP_FACET);
+        // Anyone can't call the controller action, only cBeam can
+        vm.expectRevert("Configurator/not-authorized-controller-cBeam");
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+
+        // Only whitelisted actions can be called by cBeam
+        vm.expectRevert("Configurator/not-valid-data");
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, abi.encodeCall(controller.updateIntegrations, (ids)));
+
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+
+        assertEq(controller.integrations().length,                 0);
+        assertEq(controller.getConfig(CCTP_FACET_ID).facet,        address(0));
+        assertEq(controller.getConfig(CCTP_FACET_ID).wires.length, 0);
+
+        assertEq(controller.getDispatch(IForeignControllerFullLike.cctp_transfer.selector).facet, address(0));
+    }
+
+    function test_ARBITRUM_beamState_stop() external onChain(ChainIdUtils.ArbitrumOne()) {
+        IBeamStateLike    beamState    = IBeamStateLike(PAS_BEAM_STATE);
+        IConfiguratorLike configurator = IConfiguratorLike(PAS_CONFIGURATOR);
+        IControllerLike   controller   = IControllerLike(Arbitrum.PAU_CONTROLLER);
+
+        bytes32 toDomainKey = controller.cctp_getToDomainRateLimitKey(CCTP_V2_DOMAIN_ID_ETHEREUM);
+
+        bytes32[] memory ids = new bytes32[](1);
+        ids[0] = CCTP_FACET_ID;
+
+        bytes memory removeCctpFacet = abi.encodeCall(controller.removeIntegrations, (ids));
+
+        _executeAllPayloadsAndBridges();
+
+        // stop() is IMMEDIATE (Core Council), start() is DELAYED (Timelock)
+
+        assertEq(beamState.actionsRoles(IBeamStateLike.stop.selector),  bytes32(uint256(1) << PAS_ROLE_IMMEDIATE));
+        assertEq(beamState.actionsRoles(IBeamStateLike.start.selector), bytes32(uint256(1) << PAS_ROLE_DELAYED));
+
+        assertEq(beamState.stopped(), false);
+
+        // Configurator works while not stopped
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 5_000_000e6, uint256(50_000_000e6) / 1 days);
+
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 4_000_000e6, uint256(40_000_000e6) / 1 days);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 4_000_000e6, uint256(40_000_000e6) / 1 days);
+
+        // The Timelock cannot stop
+
+        assertEq(beamState.stopped(), false);
+
+        vm.prank(PAS_TIMELOCK);
+        vm.expectRevert("BeamState/role-not-authorized");
+        beamState.stop();
+
+        assertEq(beamState.stopped(), false);
+
+        // The Core Council stops directly, with no delay
+
+        vm.expectEmit(PAS_BEAM_STATE);
+        emit IBeamStateLike.Stop();
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.stop();
+
+        assertEq(beamState.stopped(), true);
+
+        // Both Configurator entry points are blocked
+
+        vm.expectRevert("Configurator/stopped");
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 3_000_000e6, uint256(30_000_000e6) / 1 days);
+
+        vm.expectRevert("Configurator/stopped");
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+
+        // The Core Council cannot start again: that goes through the Timelock or a BeamState ward
+
+        assertEq(beamState.stopped(), true);
+
+        vm.expectRevert("BeamState/role-not-authorized");
+        vm.prank(PAS_CORE_COUNCIL);
+        beamState.start();
+
+        assertEq(beamState.stopped(), true);
+
+        vm.expectEmit(PAS_BEAM_STATE);
+        emit IBeamStateLike.Start();
+        vm.prank(PAS_TIMELOCK);
+        beamState.start();
+
+        assertEq(beamState.stopped(), false);
+
+        // Configurator works again
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 4_000_000e6, uint256(40_000_000e6) / 1 days);
+
+        vm.prank(PAS_CBEAM);
+        configurator.setRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 3_000_000e6, uint256(30_000_000e6) / 1 days);
+
+        _assertRateLimit(Arbitrum.PAU_RATELIMITS, toDomainKey, 3_000_000e6, uint256(30_000_000e6) / 1 days);
+
+        assertEq(controller.integrations().length,                                                1);
+        assertEq(controller.getConfig(CCTP_FACET_ID).facet,                                       Arbitrum.CCTP_FACET);
+        assertEq(controller.getDispatch(IForeignControllerFullLike.cctp_transfer.selector).facet, Arbitrum.CCTP_FACET);
+
+        vm.prank(PAS_CBEAM);
+        configurator.callControllerAction(Arbitrum.PAU_CONTROLLER, removeCctpFacet);
+
+        assertEq(controller.integrations().length,                                                0);
+        assertEq(controller.getConfig(CCTP_FACET_ID).facet,                                       address(0));
+        assertEq(controller.getDispatch(IForeignControllerFullLike.cctp_transfer.selector).facet, address(0));
+    }
+
     // XLayer tests
+
+    function test_XLAYER_spUsdcAdministeredAgent_roles() external onChain(ChainIdUtils.XLayer()) {
+        assertEq(xlayerAgent.adminCount(), 1);
+        assertEq(xlayerAgent.getAdmin(0),  XLayer.SPARK_EXECUTOR);
+
+        assertEq(xlayerAgent.actorCount(), 2);
+        assertEq(xlayerAgent.getActor(0),  XLayer.ALM_RELAYER_MULTISIG);
+        assertEq(xlayerAgent.getActor(1),  SPARK_HOT_WALLET);
+
+        assertEq(xlayerAgent.grantorCount(), 1);
+        assertEq(xlayerAgent.getGrantor(0),  XLayer.PAU_GRANTOR_MULTISIG);
+
+        assertEq(xlayerAgent.revokerCount(), 1);
+        assertEq(xlayerAgent.getRevoker(0),  XLayer.ALM_FREEZER_MULTISIG);
+    }
 
     function test_XLAYER_sll_cctp_e2e_roundTrip() external onChain(ChainIdUtils.XLayer()) {
         Bridge storage bridge = chainData[ChainIdUtils.XLayer()].bridges[2];
@@ -443,9 +1895,9 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         uint256 spUsdcSupplyBefore  = spusdc.totalSupply();
         uint256 spUsdcAssetsBefore  = spusdc.totalAssets();
 
-        assertEq(spUsdcBalanceBefore, 6.699_882e6);
-        assertEq(spUsdcSupplyBefore,  6.699_823e6);
-        assertEq(spUsdcAssetsBefore,  6.701_006e6);
+        assertEq(spUsdcBalanceBefore, 3_125_993.422803e6);
+        assertEq(spUsdcSupplyBefore,  3_123_537.221643e6);
+        assertEq(spUsdcAssetsBefore,  3_127_322.069182e6);
 
         assertEq(xlayerUsdc.balanceOf(user), 1_000_000e6);
         assertEq(spusdc.balanceOf(user),     0);
@@ -455,9 +1907,9 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         uint256 userShares = spusdc.deposit(1_000_000e6, user);
         vm.stopPrank();
 
-        assertEq(userShares,             999_823.392_959e6);
+        assertEq(userShares,             998_789.748079e6);
         assertEq(spusdc.balanceOf(user), userShares);
-        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 1_000_000e6 - 1); // Rounding
+        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 1_000_000e6 - 1);
         assertEq(spusdc.totalSupply(),   spUsdcSupplyBefore + userShares);
 
         assertEq(xlayerUsdc.balanceOf(user),            0);
@@ -633,60 +2085,17 @@ contract SparkEthereum_20261008_SLLTests is SparkLiquidityLayerTests {
         assertEq(xlayerUsdc.balanceOf(address(spusdc)),             spUsdcBalanceBefore + usdcWithYield);
 
         // Step 11: User redeems.
-        assertEq(spusdc.totalAssets(), spUsdcAssetsBefore + usdcWithYield + 649);  // 649 atoms accrued from yield on seeded balance
+        assertEq(spusdc.totalAssets(), spUsdcAssetsBefore + usdcWithYield + 303.040570e6);  // 303.040570e6 accrued from yield on existing balance
 
         vm.prank(user);
         spusdc.redeem(userShares, user, user);
 
-        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 649);
+        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 303.040570e6);
         assertEq(spusdc.totalSupply(),   spUsdcSupplyBefore);
         assertEq(spusdc.balanceOf(user), 0);
 
-        assertEq(xlayerUsdc.balanceOf(user),            usdcWithYield - 1); // Rounding
-        assertEq(xlayerUsdc.balanceOf(address(spusdc)), spUsdcBalanceBefore + 1); // Rounding
-    }
-
-    function test_ETHEREUM_ARBITRUM_sUsdsDistributions() public {
-        IERC4626 susds    = IERC4626(Ethereum.SUSDS);
-        IERC4626 arbSusds = IERC4626(Arbitrum.SUSDS);
-
-        address escrow = ITokenBridgeLike(Ethereum.ARBITRUM_TOKEN_BRIDGE).escrow();
-
-        uint256 ethFork = chainData[ChainIdUtils.Ethereum()].domain.forkId;
-        uint256 arbFork = chainData[ChainIdUtils.ArbitrumOne()].domain.forkId;
-
-        vm.selectFork(ethFork);
-
-        uint256 ethSusdsAlmProxyBalanceBefore = susds.balanceOf(Ethereum.ALM_PROXY);
-        uint256 ethSUsdsEscrowBalanceBefore   = susds.balanceOf(escrow);
-        uint256 ethSusdsTotalSupplyBefore     = susds.totalSupply();
-
-        assertEq(ethSusdsAlmProxyBalanceBefore, 646_459_917.628883926940814843e18);
-        assertEq(ethSUsdsEscrowBalanceBefore,   326_995_432.173787510251504877e18);
-        assertEq(ethSusdsTotalSupplyBefore,     4_012_057_245.121133010948219671e18);
-
-        assertEq(susds.balanceOf(Ethereum.SPARK_PROXY), 0);
-
-        vm.selectFork(arbFork);
-
-        uint256 arbSUsdsAlmProxyBalanceBefore = arbSusds.balanceOf(Arbitrum.ALM_PROXY);
-        uint256 arbSUsdsTotalSupplyBefore  = arbSusds.totalSupply();
-
-        assertEq(arbSUsdsAlmProxyBalanceBefore, 0.637040980963212345e18);
-        assertEq(arbSUsdsTotalSupplyBefore,     326_995_432.173787510251504877e18);
-
-        _executeAllPayloadsAndBridges();
-
-        assertEq(arbSusds.balanceOf(Arbitrum.ALM_PROXY), arbSUsdsAlmProxyBalanceBefore + SUSDS_TRANSFER_AMOUNT);
-        assertEq(arbSusds.totalSupply(),                 arbSUsdsTotalSupplyBefore + SUSDS_TRANSFER_AMOUNT);
-
-        vm.selectFork(ethFork);
-
-        assertEq(susds.balanceOf(Ethereum.ALM_PROXY), ethSusdsAlmProxyBalanceBefore - SUSDS_TRANSFER_AMOUNT);
-        assertEq(susds.balanceOf(escrow),             ethSUsdsEscrowBalanceBefore + SUSDS_TRANSFER_AMOUNT);
-        assertEq(susds.totalSupply(),                 ethSusdsTotalSupplyBefore);
-
-        assertEq(susds.balanceOf(Ethereum.SPARK_PROXY), 0);
+        assertEq(xlayerUsdc.balanceOf(user),            usdcWithYield - 1);        // Rounding
+        assertEq(xlayerUsdc.balanceOf(address(spusdc)), spUsdcBalanceBefore + 1);  // Rounding
     }
 
 }
@@ -695,13 +2104,15 @@ contract SparkEthereum_20261008_SparklendTests is SparklendTests {
 
     constructor() {
         _spellId   = 20261008;
-        _blockDate = 1790264363;  // Sep-24-2026 03:39:23 PM +UTC
+        _blockDate = 1791186678;  // Oct-05-2026 07:51:18 +UTC
     }
 
     function setUp() public override {
         super.setUp();
 
-        // chainData[ChainIdUtils.Ethereum()].payload = 0xdE40689816DA168b0A56f8F22CBD7FfCFA403E6B;
+        chainData[ChainIdUtils.ArbitrumOne()].payload = 0xb037C43b433964A2017cd689f535BEb6B0531473;
+        chainData[ChainIdUtils.Ethereum()].payload    = 0x796eE21eb57C8BE71be7F75770f534D249bC555b;
+        chainData[ChainIdUtils.XLayer()].payload      = 0x3c2B7d559Fd4bd17827B49278FCe1c7d55f39311;
     }
 
 }
@@ -713,6 +2124,21 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
 
     uint32 internal constant CCTP_V2_DOMAIN_ID_ETHEREUM = CCTPForwarder.DOMAIN_ID_CIRCLE_ETHEREUM;
     uint32 internal constant CCTP_V2_DOMAIN_ID_XLAYER   = 37;
+
+    address internal constant SOTER_FREEZER_MULTISIG = 0x747BF29B189e2a070a921Af7Cf65681E3d5F5967;
+    address internal constant SOTER_GRANTOR_MULTISIG = 0x97EC6398e5dD047BA3223cFC017bFC6436Ac3Fe7;
+
+    address internal constant SOTER_FREEZER_OWNER_1 = 0x4d30c1B366d0dEeb82F55503c334156FeC543B17;
+    address internal constant SOTER_FREEZER_OWNER_2 = 0x3481E4035409fC3a033c07D5461BED853207F517;
+    address internal constant SOTER_FREEZER_OWNER_3 = 0x1aF016f8286F55E241Efd52Cf0FEEDbB257169C9;
+    address internal constant SOTER_FREEZER_OWNER_4 = 0xB1aD1F6A80051658C2ba938621A7a83DEB0d324C;
+    address internal constant SOTER_FREEZER_OWNER_5 = 0x52A8305f29f85bEc5fa6eE78B87Ddd2218d8E12E;
+
+    address internal constant SOTER_GRANTOR_OWNER_1 = 0xd144625c5B1b261c7E7468dbae442088B9dAee65;
+    address internal constant SOTER_GRANTOR_OWNER_2 = 0x30634F700B4C281AfbB956e77f5E189f6f49bD2A;
+    address internal constant SOTER_GRANTOR_OWNER_3 = 0xd96FA1087f0CddC8dCbA53E96afBcc83cc6c82B7;
+    address internal constant SOTER_GRANTOR_OWNER_4 = 0x99E4A36dA8c62a6bEACe0BAaa6cdB042a5EaB58d;
+    address internal constant SOTER_GRANTOR_OWNER_5 = 0x0457f48919816092E5ba57f0014a104b085EC837;
 
     IAdministeredAgentLike     internal xlayerAgent;
     IForeignControllerFullLike internal xlayerController;
@@ -732,7 +2158,7 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
 
     constructor() {
         _spellId   = 20261008;
-        _blockDate = 1790264363;  // Sep-24-2026 03:39:23 PM +UTC
+        _blockDate = 1791186678;  // Oct-05-2026 07:51:18 +UTC
     }
 
     function setUp() public override {
@@ -755,7 +2181,35 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
 
         user = makeAddr("user");
 
-        // chainData[ChainIdUtils.Ethereum()].payload = 0xdE40689816DA168b0A56f8F22CBD7FfCFA403E6B;
+        chainData[ChainIdUtils.ArbitrumOne()].payload = 0xb037C43b433964A2017cd689f535BEb6B0531473;
+        chainData[ChainIdUtils.Ethereum()].payload    = 0x796eE21eb57C8BE71be7F75770f534D249bC555b;
+        chainData[ChainIdUtils.XLayer()].payload      = 0x3c2B7d559Fd4bd17827B49278FCe1c7d55f39311;
+    }
+
+    // Arbitrum tests
+
+    function test_ARBITRUM_sll_soterMultisigs_threshold() external onChain(ChainIdUtils.ArbitrumOne()) {
+        assertEq(ISafeLike(SOTER_FREEZER_MULTISIG).getThreshold(), 2);
+
+        address[] memory freezerOwners = ISafeLike(SOTER_FREEZER_MULTISIG).getOwners();
+
+        assertEq(freezerOwners.length, 5);
+        assertEq(freezerOwners[0],     SOTER_FREEZER_OWNER_1);
+        assertEq(freezerOwners[1],     SOTER_FREEZER_OWNER_2);
+        assertEq(freezerOwners[2],     SOTER_FREEZER_OWNER_3);
+        assertEq(freezerOwners[3],     SOTER_FREEZER_OWNER_4);
+        assertEq(freezerOwners[4],     SOTER_FREEZER_OWNER_5);
+
+        assertEq(ISafeLike(SOTER_GRANTOR_MULTISIG).getThreshold(), 3);
+
+        address[] memory grantorOwners = ISafeLike(SOTER_GRANTOR_MULTISIG).getOwners();
+
+        assertEq(grantorOwners.length, 5);
+        assertEq(grantorOwners[0],     SOTER_GRANTOR_OWNER_1);
+        assertEq(grantorOwners[1],     SOTER_GRANTOR_OWNER_2);
+        assertEq(grantorOwners[2],     SOTER_GRANTOR_OWNER_3);
+        assertEq(grantorOwners[3],     SOTER_GRANTOR_OWNER_4);
+        assertEq(grantorOwners[4],     SOTER_GRANTOR_OWNER_5);
     }
 
     // XLayer tests
@@ -814,9 +2268,9 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
         uint256 spUsdcSupplyBefore  = spusdc.totalSupply();
         uint256 spUsdcAssetsBefore  = spusdc.totalAssets();
 
-        assertEq(spUsdcBalanceBefore, 6.699_882e6);
-        assertEq(spUsdcSupplyBefore,  6.699_823e6);
-        assertEq(spUsdcAssetsBefore,  6.701_006e6);
+        assertEq(spUsdcBalanceBefore, 3_125_993.422803e6);
+        assertEq(spUsdcSupplyBefore,  3_123_537.221643e6);
+        assertEq(spUsdcAssetsBefore,  3_127_322.069182e6);
 
         assertEq(xlayerUsdc.balanceOf(user), 1_000_000e6);
         assertEq(spusdc.balanceOf(user),     0);
@@ -826,9 +2280,9 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
         uint256 userShares = spusdc.deposit(1_000_000e6, user);
         vm.stopPrank();
 
-        assertEq(userShares,             999_823.392_959e6);
+        assertEq(userShares,             998_789.748079e6);
         assertEq(spusdc.balanceOf(user), userShares);
-        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 1_000_000e6 - 1); // Rounding
+        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 1_000_000e6 - 1);
         assertEq(spusdc.totalSupply(),   spUsdcSupplyBefore + userShares);
 
         assertEq(xlayerUsdc.balanceOf(user),            0);
@@ -1034,7 +2488,7 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
 
         assertEq(savingsVaultIntents.vaultRequestCount(address(spusdc)), 1);
 
-        assertEq(spusdc.totalAssets(), spUsdcAssetsBefore + usdcWithYield + 649);  // 649 atoms accrued from yield on seeded balance
+        assertEq(spusdc.totalAssets(), spUsdcAssetsBefore + usdcWithYield + 303.040570e6);  // 303.040570e6 accrued from yield on existing balance
 
         vm.prank(XLayer.ALM_RELAYER_MULTISIG);
         xlayerAgent.call(
@@ -1046,12 +2500,12 @@ contract SparkEthereum_20261008_SpellTests is SpellTests {
 
         assertEq(savingsVaultIntents.vaultRequestCount(address(spusdc)), 1);
 
-        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 649);
+        assertEq(spusdc.totalAssets(),   spUsdcAssetsBefore + 303.040570e6);
         assertEq(spusdc.totalSupply(),   spUsdcSupplyBefore);
         assertEq(spusdc.balanceOf(user), 0);
 
-        assertEq(xlayerUsdc.balanceOf(user),            usdcWithYield - 1); // Rounding
-        assertEq(xlayerUsdc.balanceOf(address(spusdc)), spUsdcBalanceBefore + 1); // Rounding
+        assertEq(xlayerUsdc.balanceOf(user),            usdcWithYield - 1);        // Rounding
+        assertEq(xlayerUsdc.balanceOf(address(spusdc)), spUsdcBalanceBefore + 1);  // Rounding
     }
 
     function _assertWithdrawRequests(

@@ -325,12 +325,6 @@ interface IPSMLike {
 
 }
 
-interface ICurveStableswapFactoryLike {
-
-    function get_implementation_address(address pool) external view returns (address);
-
-}
-
 interface IFarmLike {
 
     function earned(address account) external view returns (uint256);
@@ -366,6 +360,8 @@ interface IATokenLike {
 }
 
 interface IERC20Like {
+
+    function approve(address spender, uint256 amount) external returns (bool);
 
     function balanceOf(address account) external view returns (uint256);
 

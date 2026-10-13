@@ -8,9 +8,9 @@ import { CCTPForwarder } from "xchain-helpers/forwarders/CCTPForwarder.sol";
 
 import { SparkPayloadArbitrumOne } from "../../SparkPayloadArbitrumOne.sol";
 
-interface IAccessControlsLike {
+import { IERC20Like } from "../../interfaces/Interfaces.sol";
 
-    function DEFAULT_ADMIN_ROLE() external returns (bytes32);
+interface IAccessControlsLike {
 
     function grantRole(bytes32 role, address account) external;
 
@@ -22,17 +22,11 @@ interface IAdministeredAgentLike {
 
     function addActor(address actor) external;
 
-    function addAdmin(address admin) external;
-
     function addGrantor(address grantor) external;
 
     function addRevoker(address revoker) external;
 
-    function removeAdmin(address admin) external;
-
     function removeGrantor(address grantor) external;
-
-    function removeRevoker(address revoker) external;
 
 }
 
@@ -52,8 +46,6 @@ interface IALMProxyLike {
 }
 
 interface IBeaconLike {
-
-    function DEFAULT_ADMIN_ROLE() external returns (bytes32);
 
     function grantRole(bytes32 role, address account) external;
 
@@ -79,21 +71,9 @@ interface IControllerLike {
 
 }
 
-interface IERC20Like {
-
-    function approve(address spender, uint256 amount) external returns (bool);
-
-    function balanceOf(address account) external view returns (uint256);
-
-}
-
 interface IRateLimitsLike {
 
-    function DEFAULT_ADMIN_ROLE() external returns (bytes32);
-
     function grantRole(bytes32 role, address account) external;
-
-    function revokeRole(bytes32 role, address account) external;
 
     function setRateLimitData(bytes32 key, uint256 maxAmount, uint256 slope) external;
 
@@ -130,10 +110,10 @@ contract SparkArbitrumOne_20261008 is SparkPayloadArbitrumOne {
 
     bytes32 internal constant DEFAULT_ADMIN_ROLE = 0x00;
 
-    address internal constant PAS_CONFIGURATOR       = 0x0000000000000000000000000000000000000000;  // TODO: Add actual address
-    address internal constant SOTER_FREEZER_MULTISIG = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
-    address internal constant SOTER_GRANTOR_MULTISIG = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
-    address internal constant SPARK_HOT_WALLET       = 0xC758519Ace14E884fdbA9ccE25F2DbE81b7e136f;  // TODO: Add actual address
+    address internal constant PAS_CONFIGURATOR       = 0xd11Dc57F3eF23bb7b3142588a461F68460a7C474;
+    address internal constant SOTER_FREEZER_MULTISIG = 0x747BF29B189e2a070a921Af7Cf65681E3d5F5967;
+    address internal constant SOTER_GRANTOR_MULTISIG = 0x97EC6398e5dD047BA3223cFC017bFC6436Ac3Fe7;
+    address internal constant SPARK_HOT_WALLET       = 0x062cE42caE04c51D04E77e3D64cc8953a2296FfE;
 
     function execute() external {
         // 1. Onboard Parallel Diamond PAU with CCTP V2.
